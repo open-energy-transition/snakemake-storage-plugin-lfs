@@ -18,6 +18,7 @@ from snakemake_storage_plugin_lfs import (
     StorageProviderSettings,
     WrongChecksum,
 )
+from snakemake_interface_common.exceptions import WorkflowError
 from tests.conftest import assert_no_http_requests
 
 # A real SHA-256 OID and corresponding content for testing
@@ -485,15 +486,14 @@ def test_local_repo_lfs_pointer_ignored(tmp_path, test_logger):
 
 
 @pytest.mark.asyncio
-async def test_local_repo_oid_mismatch_falls_through(tmp_path, test_logger, mock_lfs_server, caplog):
-    """Test that a checked-out file with wrong content triggers a warning and falls through to download."""
+async def test_local_repo_oid_mismatch_raises(tmp_path, test_logger):
+    """Test that a checked-out file with wrong content raises a WorkflowError."""
     wrong_content = b"this is wrong content"
 
-    # Create a fake local repo with wrong content at the expected path
     repo_dir = tmp_path / "repo"
     checked_out_file = repo_dir / "path" / "to" / "test.json"
     checked_out_file.parent.mkdir(parents=True)
-    checked_out_file.write_bytes(wrong_content)  # wrong content -> OID mismatch
+    checked_out_file.write_bytes(wrong_content)
 
     local_prefix = tmp_path / "local"
     local_prefix.mkdir()
@@ -508,24 +508,6 @@ async def test_local_repo_oid_mismatch_falls_through(tmp_path, test_logger, mock
         logger=test_logger,
         settings=settings,
     )
-
-    # Inject metadata
-    provider._lfs_metadata_cache[TEST_OID] = FileMetadata(
-        checksum=f"sha256:{TEST_OID}",
-        size=len(TEST_CONTENT),
-        download_url=TEST_DOWNLOAD_URL,
-        download_headers={},
-    )
-
-    mock_client = MagicMock()
-    mock_client.stream = mock_lfs_server["mock_stream"]
-
-    @asynccontextmanager
-    async def mock_client_ctx():
-        yield mock_client
-
-    provider.client = mock_client_ctx
-
     obj = StorageObject(
         query=TEST_URL,
         keep_local=False,
@@ -537,10 +519,5 @@ async def test_local_repo_oid_mismatch_falls_through(tmp_path, test_logger, mock
     local_path.parent.mkdir(parents=True, exist_ok=True)
     obj.local_path = lambda: local_path
 
-    with caplog.at_level(logging.WARNING):
+    with pytest.raises(WorkflowError, match="different version"):
         await obj.managed_retrieve()
-
-    assert any("OID mismatch" in r.message for r in caplog.records)
-
-    # Should have downloaded the correct content
-    assert local_path.read_bytes() == TEST_CONTENT

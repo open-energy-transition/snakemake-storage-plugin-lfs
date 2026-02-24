@@ -6,8 +6,8 @@ import hashlib
 import os
 import shutil
 from contextlib import asynccontextmanager
-from functools import cached_property
 from dataclasses import dataclass, field
+from functools import cached_property
 from logging import Logger
 from pathlib import Path
 from urllib.parse import urlparse
@@ -377,7 +377,9 @@ class StorageObject(StorageObjectRead):
         # Skip LFS pointer stubs (file not yet pulled)
         with candidate.open("rb") as f:
             if f.read(43) == b"version https://git-lfs.github.com/spec/v1\n":
-                logger.warning(f"Skipping LFS pointer stub in local repo: {self.lfs_path}")
+                logger.warning(
+                    f"Skipping LFS pointer stub in local repo: {self.lfs_path}"
+                )
                 return None
         return candidate
 
@@ -497,20 +499,6 @@ class StorageObject(StorageObjectRead):
         if checksum_expected != checksum_observed:
             raise WrongChecksum(observed=checksum_observed, expected=checksum_expected)
 
-    def _copy_from_source(self, source: Path, local_path: Path, label: str) -> bool:
-        """Copy file from source to local_path, verifying the OID matches."""
-        try:
-            self.verify_checksum(source)
-        except WrongChecksum as e:
-            logger.warning(
-                f"OID mismatch for {label}: expected {e.expected}, got {e.observed}. "
-                "Falling through to remote download."
-            )
-            return False
-
-        shutil.copy2(source, local_path)
-        return True
-
     @retry_decorator
     async def managed_retrieve(self):
         """Async download with concurrency control, local repo lookup, caching, and checksum verification."""
@@ -521,27 +509,37 @@ class StorageObject(StorageObjectRead):
         filename = self.lfs_path.split("/")[-1] if self.lfs_path else self.oid[:12]
 
         # 1. Try local repo first
-        local_obj = self.local_repo_file
-        if local_obj is not None:
-            copied = self._copy_from_source(
-                local_obj, local_path, f"local repo file {self.lfs_path}"
-            )
-            if copied:
-                logger.info(f"Retrieved {filename} from local repo ({self.oid[:12]})")
-                return
+        local_file = self.local_repo_file
+        if local_file is not None:
+            try:
+                self.verify_checksum(local_file)
+            except WrongChecksum as e:
+                raise WorkflowError(
+                    f"Local repository file {self.lfs_path!r} exists, but has different "
+                    f"content:\n"
+                    f"  Expected OID: {e.expected}\n"
+                    f"  Found OID:    {e.observed}"
+                ) from e
+            shutil.copy2(local_file, local_path)
+            logger.info(f"Retrieved {filename} from local repo ({self.oid[:12]})")
+            return
 
         # 2. Try cache
         if self.provider.cache:
             cached = self.provider.cache.get(query)
             if cached is not None:
-                copied = self._copy_from_source(
-                    cached, local_path, f"cache ({self.oid[:12]})"
-                )
-                if copied:
+                try:
+                    self.verify_checksum(cached)
+                    shutil.copy2(cached, local_path)
                     logger.info(f"Retrieved {filename} from cache ({self.oid[:12]})")
                     return
-                # Cache entry was corrupt – remove it
-                cached.unlink(missing_ok=True)
+                except WrongChecksum as e:
+                    logger.warning(
+                        f"Cached file has unexpected checksum: expected {e.expected}, "
+                        f"got {e.observed}. Discarding cache entry and downloading from remote."
+                    )
+                    # Cache entry was corrupt – remove it
+                    cached.unlink(missing_ok=True)
 
         # 3. Fetch download URL from LFS batch API
         metadata = await self.provider.get_metadata(self.oid)

@@ -58,7 +58,7 @@ storage lfs:
 |---------|---------|---------|-------------|
 | `repo_url` | `""` | `SNAKEMAKE_STORAGE_LFS_REPO_URL` | Git repository URL used to construct the LFS Batch API endpoint (e.g. `https://github.com/org/repo`). **Required.** |
 | `token_envvar` | `""` | — | Name of the environment variable containing the authentication token (used as Basic Auth password with username `git`). |
-| `local_repo` | `""` | `SNAKEMAKE_STORAGE_LFS_LOCAL_REPO` | Path to a local git repository. Files are looked up by path in the working tree before downloading remotely. If found but the SHA-256 hash does not match the OID, a warning is issued and the remote is used. |
+| `local_repo` | `""` | `SNAKEMAKE_STORAGE_LFS_LOCAL_REPO` | Path to a local git repository. Files are looked up by path in the working tree before downloading remotely. If the file exists but its SHA-256 hash does not match the OID, a `WorkflowError` is raised (the local repo contains a different version). LFS pointer stubs (not-yet-pulled files) are detected and skipped. |
 | `cache` | `""` | `SNAKEMAKE_STORAGE_LFS_CACHE` | Path to a cache directory for downloaded objects. Set to a path to enable caching; leave empty to disable. |
 | `skip_remote_checks` | `False` | `SNAKEMAKE_STORAGE_LFS_SKIP_REMOTE_CHECKS` | Skip existence/size checks against the remote LFS server. Useful in CI/CD when inputs are known to exist. |
 | `max_concurrent_downloads` | `3` | — | Maximum number of simultaneous downloads. |
@@ -120,7 +120,7 @@ snakemake --cores all
 
 Priority order in `managed_retrieve()`:
 
-1. **Local repo** (`local_repo` setting): Looks up the file by its path in the working tree (`{local_repo}/{lfs_path}`). The SHA-256 hash is verified against the OID; on mismatch a warning is issued and download proceeds.
+1. **Local repo** (`local_repo` setting): Looks up the file by its path in the working tree (`{local_repo}/{lfs_path}`). LFS pointer stubs are skipped (with a warning). If the file is present but its SHA-256 does not match the OID, a `WorkflowError` is raised — the local repo contains a different version of the file.
 2. **Cache** (`cache` setting): Checks the configured cache directory.
 3. **Remote**: Queries the LFS Batch API (`{repo_url}.git/info/lfs/objects/batch`) and downloads from the returned URL.
 
