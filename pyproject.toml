@@ -3,24 +3,22 @@
 # SPDX-License-Identifier: MIT
 
 [project]
-name = "snakemake-storage-plugin-cached-http"
+name = "snakemake-storage-plugin-lfs"
 dynamic = ["version"]
-description = "Snakemake storage plugin for downloading files via HTTP with caching and rate limiting"
+description = "Snakemake storage plugin for downloading Git LFS files with optional local caching"
 authors = [
     { name = "PyPSA-Eur Authors", email = "jonas.hoersch@openenergytransition.org" },
 ]
 readme = "README.md"
 license = "MIT"
-keywords = ["snakemake", "plugin", "storage", "http", "cache"]
+keywords = ["snakemake", "plugin", "storage", "git", "lfs", "cache"]
 requires-python = ">=3.11"
 dependencies = [
     "httpx ~= 0.27",
-    "platformdirs ~= 4.0",
     "reretry ~= 0.11",
     "snakemake-interface-common ~= 1.14",
     "snakemake-interface-storage-plugins >=4.2,<5.0",
-    "snakemake-storage-plugin-http ~= 0.3",
-    "tqdm-loggable ~= 0.2",
+    "tqdm-loggable ~= 0.3",
     "typing-extensions ~= 4.15",
     "zstandard ~=0.25.0",
 ]
@@ -72,7 +70,7 @@ dev = [
 
 [tool.basedpyright]
 reportImplicitStringConcatenation = false
-ignore = ["tests", "src/snakemake_storage_plugin_cached_http/monkeypatch.py"]
+ignore = ["tests"]
 reportUnusedCallResult = false
 reportAny = false
 reportMissingTypeStubs = false

@@ -14,7 +14,7 @@ logger = get_logger()
 
 @dataclass
 class Cache:
-    """Manages local file cache for downloaded Zenodo files"""
+    """Manages local file cache for downloaded LFS files"""
 
     cache_dir: Path
 

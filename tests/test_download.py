@@ -2,16 +2,17 @@
 #
 # SPDX-License-Identifier: MIT
 
-"""Functional tests for downloading and checksumming from Zenodo and data.pypsa.org."""
+"""Tests for the Git LFS storage plugin."""
 
-import json
+import hashlib
 import logging
-import os
-import time
+from contextlib import asynccontextmanager
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from snakemake_storage_plugin_cached_http import (
+    FileMetadata,
     StorageObject,
     StorageProvider,
     StorageProviderSettings,
@@ -19,47 +20,52 @@ from snakemake_storage_plugin_cached_http import (
 )
 from tests.conftest import assert_no_http_requests
 
-# Test URLs and their metadata paths
-TEST_CONFIGS = {
-    "zenodo": {
-        "url": "https://zenodo.org/records/16810901/files/attributed_ports.json",
-        "path": "records/16810901/files/attributed_ports.json",
-        "netloc": "zenodo.org",
-        "has_size": True,
-        "has_mtime": False,  # Zenodo records are immutable
-    },
-    "pypsa": {
-        "url": "https://data.pypsa.org/workflows/eur/attributed_ports/2020-07-10/attributed_ports.json",
-        "path": "workflows/eur/attributed_ports/2020-07-10/attributed_ports.json",
-        "netloc": "data.pypsa.org",
-        "has_size": False,  # data.pypsa.org manifests don't include size
-        "has_mtime": False,  # data.pypsa.org files are immutable
-    },
-    "gcs": {
-        "url": "https://storage.googleapis.com/open-tyndp-data-store/cached-http/attributed_ports/archive/2020-07-10/attributed_ports.json",
-        "path": "open-tyndp-data-store/cached-http/attributed_ports/archive/2020-07-10/attributed_ports.json",
-        "netloc": "storage.googleapis.com",
-        "has_size": True,
-        "has_mtime": True,  # GCS provides modification timestamps
-    },
-}
+# A real SHA-256 OID and corresponding content for testing
+TEST_CONTENT = b'{"test": "data", "value": 42}'
+TEST_OID = hashlib.sha256(TEST_CONTENT).hexdigest()
+TEST_URL = f"lfs://{TEST_OID}/path/to/test.json"
+TEST_DOWNLOAD_URL = "https://lfs-server.example.com/objects/" + TEST_OID
 
 
 @pytest.fixture
 def test_logger():
-    """Provide a logger for testing."""
     return logging.getLogger("test")
 
 
 @pytest.fixture
 def storage_provider(tmp_path, test_logger):
-    """Create a StorageProvider instance for testing."""
+    local_prefix = tmp_path / "local"
+    local_prefix.mkdir()
+
+    settings = StorageProviderSettings(
+        repo_url="https://github.com/org/repo",
+        token_envvar="",
+        local_repo="",
+        cache="",
+        skip_remote_checks=False,
+        max_concurrent_downloads=3,
+    )
+
+    provider = StorageProvider(
+        local_prefix=local_prefix,
+        logger=test_logger,
+        settings=settings,
+    )
+
+    return provider
+
+
+@pytest.fixture
+def storage_provider_with_cache(tmp_path, test_logger):
     cache_dir = tmp_path / "cache"
     cache_dir.mkdir()
     local_prefix = tmp_path / "local"
     local_prefix.mkdir()
 
     settings = StorageProviderSettings(
+        repo_url="https://github.com/org/repo",
+        token_envvar="",
+        local_repo="",
         cache=str(cache_dir),
         skip_remote_checks=False,
         max_concurrent_downloads=3,
@@ -74,265 +80,440 @@ def storage_provider(tmp_path, test_logger):
     return provider
 
 
-@pytest.fixture(params=["zenodo", "pypsa", "gcs"])
-def test_config(request):
-    """Provide test configuration (parametrized for zenodo, pypsa, and gcs)."""
-    return TEST_CONFIGS[request.param]
-
-
-@pytest.fixture(params=[k for k, v in TEST_CONFIGS.items() if v["has_mtime"]])
-def mutable_test_config(request):
-    """Provide test configuration for mutable sources only (those with mtime support)."""
-    return TEST_CONFIGS[request.param]
-
-
 @pytest.fixture
-def storage_object(test_config, storage_provider):
-    """Create a StorageObject for the test file (parametrized for zenodo and pypsa)."""
-    obj = StorageObject(
-        query=test_config["url"],
+def storage_object(storage_provider):
+    return StorageObject(
+        query=TEST_URL,
         keep_local=False,
         retrieve=True,
         provider=storage_provider,
     )
-    yield obj
 
 
-@pytest.mark.asyncio
-async def test_metadata_fetch(storage_provider, test_config):
-    """Test that we can fetch metadata from the API/manifest."""
-    metadata = await storage_provider.get_metadata(
-        test_config["path"], test_config["netloc"]
+def make_lfs_batch_response(oid: str, download_url: str, size: int) -> dict:
+    """Create a mock LFS batch API response."""
+    return {
+        "transfer": "basic",
+        "objects": [
+            {
+                "oid": oid,
+                "size": size,
+                "actions": {
+                    "download": {
+                        "href": download_url,
+                        "header": {},
+                    }
+                },
+            }
+        ],
+    }
+
+
+def make_lfs_batch_not_found_response(oid: str) -> dict:
+    """Create a mock LFS batch API response for a missing object."""
+    return {
+        "transfer": "basic",
+        "objects": [
+            {
+                "oid": oid,
+                "size": 0,
+                "error": {"code": 404, "message": "Object not found"},
+            }
+        ],
+    }
+
+
+@pytest.fixture
+def mock_lfs_server(monkeypatch):
+    """
+    Fixture that mocks the LFS batch API and download endpoint.
+
+    Returns a dict with the mock objects so tests can inspect calls.
+    """
+    batch_response_data = make_lfs_batch_response(TEST_OID, TEST_DOWNLOAD_URL, len(TEST_CONTENT))
+
+    async def mock_post(url, **kwargs):
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = batch_response_data
+        return resp
+
+    @asynccontextmanager
+    async def mock_stream(method, url, **kwargs):
+        resp = AsyncMock()
+        resp.status_code = 200
+        resp.headers = {"content-length": str(len(TEST_CONTENT))}
+
+        async def aiter_bytes(chunk_size=8192):
+            yield TEST_CONTENT
+
+        resp.aiter_bytes = aiter_bytes
+        yield resp
+
+    return {
+        "batch_response": batch_response_data,
+        "mock_post": mock_post,
+        "mock_stream": mock_stream,
+    }
+
+
+def test_storage_object_parsing():
+    """Test that lfs:// URLs are parsed correctly."""
+    settings = StorageProviderSettings(repo_url="https://github.com/org/repo")
+    provider = StorageProvider(
+        local_prefix=MagicMock(),
+        logger=logging.getLogger("test"),
+        settings=settings,
+    )
+    obj = StorageObject(
+        query=TEST_URL,
+        keep_local=False,
+        retrieve=True,
+        provider=provider,
     )
 
-    assert metadata is not None
-    assert metadata.checksum is not None
-    assert metadata.checksum.startswith("md5:")
-    if test_config["has_size"]:
-        assert metadata.size > 0
+    assert obj.oid == TEST_OID
+    assert obj.lfs_path == "path/to/test.json"
+
+
+def test_lfs_batch_api_url():
+    """Test that the LFS batch API URL is constructed correctly."""
+    settings = StorageProviderSettings(repo_url="https://github.com/org/repo")
+    provider = StorageProvider(
+        local_prefix=MagicMock(),
+        logger=logging.getLogger("test"),
+        settings=settings,
+    )
+
+    url = provider._lfs_batch_api_url()
+    assert url == "https://github.com/org/repo.git/info/lfs/objects/batch"
+
+
+def test_lfs_batch_api_url_trailing_slash():
+    """Test that trailing slashes in repo_url are handled."""
+    settings = StorageProviderSettings(repo_url="https://github.com/org/repo/")
+    provider = StorageProvider(
+        local_prefix=MagicMock(),
+        logger=logging.getLogger("test"),
+        settings=settings,
+    )
+
+    url = provider._lfs_batch_api_url()
+    assert url == "https://github.com/org/repo.git/info/lfs/objects/batch"
 
 
 @pytest.mark.asyncio
-async def test_storage_object_exists(storage_object):
-    """Test that the storage object reports existence correctly."""
+async def test_get_metadata_from_batch_api(storage_provider, mock_lfs_server):
+    """Test that get_metadata correctly queries the LFS batch API."""
+    mock_client = MagicMock()
+    mock_client.post = mock_lfs_server["mock_post"]
+
+    @asynccontextmanager
+    async def mock_client_ctx():
+        yield mock_client
+
+    storage_provider.client = mock_client_ctx
+
+    metadata = await storage_provider.get_metadata(TEST_OID)
+
+    assert metadata is not None
+    assert metadata.size == len(TEST_CONTENT)
+    assert metadata.checksum == f"sha256:{TEST_OID}"
+    assert metadata.download_url == TEST_DOWNLOAD_URL
+
+
+@pytest.mark.asyncio
+async def test_get_metadata_not_found(storage_provider):
+    """Test that get_metadata returns None for missing objects."""
+    not_found_oid = "a" * 64
+
+    async def mock_post(url, **kwargs):
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = make_lfs_batch_not_found_response(not_found_oid)
+        return resp
+
+    mock_client = MagicMock()
+    mock_client.post = mock_post
+
+    @asynccontextmanager
+    async def mock_client_ctx():
+        yield mock_client
+
+    storage_provider.client = mock_client_ctx
+
+    metadata = await storage_provider.get_metadata(not_found_oid)
+    assert metadata is None
+
+
+@pytest.mark.asyncio
+async def test_managed_exists_with_metadata(storage_object, mock_lfs_server):
+    """Test managed_exists returns True when LFS object exists."""
+    mock_client = MagicMock()
+    mock_client.post = mock_lfs_server["mock_post"]
+
+    @asynccontextmanager
+    async def mock_client_ctx():
+        yield mock_client
+
+    storage_object.provider.client = mock_client_ctx
+
     exists = await storage_object.managed_exists()
     assert exists is True
 
 
 @pytest.mark.asyncio
-async def test_storage_object_size(storage_object, test_config):
-    """Test that the storage object reports size correctly."""
-    size = await storage_object.managed_size()
-    if test_config["has_size"]:
-        assert size > 0
-        # The file is a small JSON file, should be less than 1MB
-        assert size < 1_000_000
-    else:
-        # data.pypsa.org manifests don't include size
-        assert size == 0
-
-
-@pytest.mark.asyncio
-async def test_storage_object_mtime(storage_object, test_config):
-    """Test that mtime is 0 for immutable URLs, non-zero for mutable sources."""
+async def test_managed_mtime_is_zero(storage_object):
+    """LFS objects are immutable so mtime is always 0."""
     mtime = await storage_object.managed_mtime()
-    if test_config["has_mtime"]:
-        assert mtime > 0
-    else:
-        assert mtime == 0
+    assert mtime == 0
 
 
 @pytest.mark.asyncio
-async def test_download_and_checksum(storage_object, tmp_path):
-    """Test downloading a file and verifying its checksum."""
-    local_path = tmp_path / "test_download" / "attributed_ports.json"
-    local_path.parent.mkdir(parents=True, exist_ok=True)
+async def test_managed_size(storage_object, mock_lfs_server):
+    """Test that managed_size returns the size from LFS batch API."""
+    mock_client = MagicMock()
+    mock_client.post = mock_lfs_server["mock_post"]
 
-    # Mock the local_path method to return our test path
-    storage_object.local_path = lambda: local_path
+    @asynccontextmanager
+    async def mock_client_ctx():
+        yield mock_client
 
-    # Download the file
-    await storage_object.managed_retrieve()
+    storage_object.provider.client = mock_client_ctx
 
-    # Verify file was downloaded
-    assert local_path.exists()
-    assert local_path.stat().st_size > 0
-
-    # Verify it's valid JSON
-    with open(local_path, encoding="utf-8", errors="replace") as f:
-        data = json.load(f)
-        assert isinstance(data, (dict, list))
-
-    # Verify checksum (should not raise WrongChecksum exception)
-    await storage_object.verify_checksum(local_path)
+    size = await storage_object.managed_size()
+    assert size == len(TEST_CONTENT)
 
 
 @pytest.mark.asyncio
-async def test_cache_functionality(storage_provider, test_config, tmp_path):
-    """Test that files are cached after download."""
-    url = test_config["url"]
-
-    # First download
-    obj1 = StorageObject(
-        query=url,
-        keep_local=False,
-        retrieve=True,
-        provider=storage_provider,
-    )
-
-    local_path1 = tmp_path / "download1" / "attributed_ports.json"
-    local_path1.parent.mkdir(parents=True, exist_ok=True)
-    obj1.local_path = lambda: local_path1
-
-    await obj1.managed_retrieve()
-
-    # Verify cache was populated
-    assert obj1.provider.cache is not None
-    cached_path = obj1.provider.cache.get(url)
-    assert cached_path is not None
-    assert cached_path.exists()
-
-    # Second download should use cache - verify by checking no HTTP requests are made
-    obj2 = StorageObject(
-        query=url,
-        keep_local=False,
-        retrieve=True,
-        provider=storage_provider,
-    )
-
-    local_path2 = tmp_path / "download2" / "attributed_ports.json"
-    local_path2.parent.mkdir(parents=True, exist_ok=True)
-    obj2.local_path = lambda: local_path2
-
-    # Verify no HTTP requests are made (cache hit skips download, metadata is cached)
-    with assert_no_http_requests(storage_provider):
-        await obj2.managed_retrieve()
-
-    # Both files should be identical
-    assert local_path1.read_bytes() == local_path2.read_bytes()
-
-
-@pytest.mark.asyncio
-async def test_skip_remote_checks(test_config, tmp_path, test_logger):
-    """Test that skip_remote_checks works correctly."""
+async def test_skip_remote_checks(tmp_path, test_logger):
+    """Test that skip_remote_checks returns defaults without API calls."""
     local_prefix = tmp_path / "local"
     local_prefix.mkdir()
 
-    # Create provider with skip_remote_checks enabled
     settings = StorageProviderSettings(
-        cache="",  # No cache
+        repo_url="https://github.com/org/repo",
         skip_remote_checks=True,
-        max_concurrent_downloads=3,
     )
-
-    provider_skip = StorageProvider(
+    provider = StorageProvider(
         local_prefix=local_prefix,
         logger=test_logger,
         settings=settings,
     )
-
     obj = StorageObject(
-        query=test_config["url"],
+        query=TEST_URL,
         keep_local=False,
         retrieve=True,
-        provider=provider_skip,
+        provider=provider,
     )
 
-    # With skip_remote_checks, these should return default values without API calls
     assert await obj.managed_exists() is True
     assert await obj.managed_mtime() == 0
     assert await obj.managed_size() == 0
 
 
 @pytest.mark.asyncio
-async def test_wrong_checksum_detection(storage_object, tmp_path):
-    """Test that corrupted files are detected via checksum."""
-    # Create a corrupted file
-    corrupted_path = tmp_path / "corrupted.json"
-    corrupted_path.write_text('{"corrupted": "data"}')
+async def test_download_and_checksum(storage_object, mock_lfs_server, tmp_path):
+    """Test downloading an LFS object and verifying its checksum."""
+    local_path = tmp_path / "test_download" / "test.json"
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+    storage_object.local_path = lambda: local_path
 
-    # Verify checksum should raise WrongChecksum
+    # Pre-populate metadata cache so we don't need to mock POST
+    storage_object.provider._lfs_metadata_cache[TEST_OID] = FileMetadata(
+        checksum=f"sha256:{TEST_OID}",
+        size=len(TEST_CONTENT),
+        download_url=TEST_DOWNLOAD_URL,
+        download_headers={},
+    )
+
+    mock_client = MagicMock()
+    mock_client.stream = mock_lfs_server["mock_stream"]
+
+    @asynccontextmanager
+    async def mock_client_ctx():
+        yield mock_client
+
+    storage_object.provider.client = mock_client_ctx
+
+    await storage_object.managed_retrieve()
+
+    assert local_path.exists()
+    assert local_path.read_bytes() == TEST_CONTENT
+
+    # Verify checksum passes
+    storage_object.verify_checksum(local_path)
+
+
+def test_wrong_checksum_detection(storage_object, tmp_path):
+    """Test that corrupted files are detected via checksum."""
+    corrupted_path = tmp_path / "corrupted.json"
+    corrupted_path.write_bytes(b'{"corrupted": "data"}')
+
     with pytest.raises(WrongChecksum):
-        await storage_object.verify_checksum(corrupted_path)
+        storage_object.verify_checksum(corrupted_path)
 
 
 @pytest.mark.asyncio
-async def test_cache_staleness_for_mutable_sources(
-    mutable_test_config, tmp_path, test_logger
-):
-    """Test that stale cached files are re-downloaded for mutable sources."""
-    url = mutable_test_config["url"]
+async def test_cache_stores_and_retrieves(storage_provider_with_cache, mock_lfs_server, tmp_path):
+    """Test that files are cached after download and reused on second access."""
+    obj1 = StorageObject(
+        query=TEST_URL,
+        keep_local=False,
+        retrieve=True,
+        provider=storage_provider_with_cache,
+    )
 
-    cache_dir = tmp_path / "cache"
-    cache_dir.mkdir()
+    local_path1 = tmp_path / "download1" / "test.json"
+    local_path1.parent.mkdir(parents=True, exist_ok=True)
+    obj1.local_path = lambda: local_path1
+
+    # Inject metadata
+    storage_provider_with_cache._lfs_metadata_cache[TEST_OID] = FileMetadata(
+        checksum=f"sha256:{TEST_OID}",
+        size=len(TEST_CONTENT),
+        download_url=TEST_DOWNLOAD_URL,
+        download_headers={},
+    )
+
+    mock_client = MagicMock()
+    mock_client.stream = mock_lfs_server["mock_stream"]
+
+    @asynccontextmanager
+    async def mock_client_ctx():
+        yield mock_client
+
+    storage_provider_with_cache.client = mock_client_ctx
+
+    await obj1.managed_retrieve()
+
+    # Verify cache was populated
+    assert storage_provider_with_cache.cache is not None
+    cached_path = storage_provider_with_cache.cache.get(TEST_URL)
+    assert cached_path is not None
+    assert cached_path.exists()
+
+    # Second download should use cache (no HTTP requests)
+    obj2 = StorageObject(
+        query=TEST_URL,
+        keep_local=False,
+        retrieve=True,
+        provider=storage_provider_with_cache,
+    )
+    local_path2 = tmp_path / "download2" / "test.json"
+    local_path2.parent.mkdir(parents=True, exist_ok=True)
+    obj2.local_path = lambda: local_path2
+
+    with assert_no_http_requests(storage_provider_with_cache):
+        await obj2.managed_retrieve()
+
+    assert local_path1.read_bytes() == local_path2.read_bytes()
+
+
+@pytest.mark.asyncio
+async def test_local_repo_lookup(tmp_path, test_logger):
+    """Test that files are found in the local git LFS store."""
+    # Create a fake local repo with the LFS object
+    repo_dir = tmp_path / "repo"
+    lfs_obj_dir = repo_dir / ".git" / "lfs" / "objects" / TEST_OID[:2] / TEST_OID[2:4]
+    lfs_obj_dir.mkdir(parents=True)
+    lfs_obj_path = lfs_obj_dir / TEST_OID
+    lfs_obj_path.write_bytes(TEST_CONTENT)
+
     local_prefix = tmp_path / "local"
     local_prefix.mkdir()
 
     settings = StorageProviderSettings(
-        cache=str(cache_dir),
-        skip_remote_checks=False,
-        max_concurrent_downloads=3,
+        repo_url="https://github.com/org/repo",
+        local_repo=str(repo_dir),
+        cache="",
     )
-
     provider = StorageProvider(
         local_prefix=local_prefix,
         logger=test_logger,
         settings=settings,
     )
 
-    # First download to populate cache
-    obj1 = StorageObject(
-        query=url,
+    # Verify _find_local_lfs_object finds it
+    found = provider._find_local_lfs_object(TEST_OID)
+    assert found is not None
+    assert found == lfs_obj_path
+
+    # Verify managed_retrieve uses the local object (no HTTP)
+    obj = StorageObject(
+        query=TEST_URL,
         keep_local=False,
         retrieve=True,
         provider=provider,
     )
 
-    local_path1 = tmp_path / "download1" / "testfile"
-    local_path1.parent.mkdir(parents=True, exist_ok=True)
-    obj1.local_path = lambda: local_path1
+    local_path = tmp_path / "out" / "test.json"
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+    obj.local_path = lambda: local_path
 
-    await obj1.managed_retrieve()
+    with assert_no_http_requests(provider):
+        await obj.managed_retrieve()
 
-    # Verify cache was populated
-    assert provider.cache is not None
-    cached_path = provider.cache.get(url)
-    assert cached_path is not None
-    assert cached_path.exists()
+    assert local_path.read_bytes() == TEST_CONTENT
 
-    # Modify the cached file slightly
-    original_content = cached_path.read_bytes()
-    modified_content = original_content.replace(b"}", b', "stale": true}')
-    cached_path.write_bytes(modified_content)
 
-    # Set mtime to 5 years ago
-    five_years_ago = time.time() - (5 * 365 * 24 * 60 * 60)
-    os.utime(cached_path, (five_years_ago, five_years_ago))
+@pytest.mark.asyncio
+async def test_local_repo_oid_mismatch_falls_through(tmp_path, test_logger, mock_lfs_server):
+    """Test that a local LFS object with wrong OID triggers a warning and falls through to download."""
+    wrong_content = b"this is wrong content"
+    expected_oid = TEST_OID  # we still expect to download TEST_CONTENT
 
-    # Clear metadata cache to force re-fetch
-    provider._gcs_metadata_cache.clear()
+    # Create a fake local repo with wrong content stored under the right OID path
+    repo_dir = tmp_path / "repo"
+    lfs_obj_dir = repo_dir / ".git" / "lfs" / "objects" / TEST_OID[:2] / TEST_OID[2:4]
+    lfs_obj_dir.mkdir(parents=True)
+    lfs_obj_path = lfs_obj_dir / TEST_OID
+    lfs_obj_path.write_bytes(wrong_content)  # wrong content -> OID mismatch
 
-    # Second download should detect stale cache and re-download
-    obj2 = StorageObject(
-        query=url,
+    local_prefix = tmp_path / "local"
+    local_prefix.mkdir()
+
+    settings = StorageProviderSettings(
+        repo_url="https://github.com/org/repo",
+        local_repo=str(repo_dir),
+        cache="",
+    )
+    provider = StorageProvider(
+        local_prefix=local_prefix,
+        logger=test_logger,
+        settings=settings,
+    )
+
+    # Inject metadata
+    provider._lfs_metadata_cache[TEST_OID] = FileMetadata(
+        checksum=f"sha256:{TEST_OID}",
+        size=len(TEST_CONTENT),
+        download_url=TEST_DOWNLOAD_URL,
+        download_headers={},
+    )
+
+    mock_client = MagicMock()
+    mock_client.stream = mock_lfs_server["mock_stream"]
+
+    @asynccontextmanager
+    async def mock_client_ctx():
+        yield mock_client
+
+    provider.client = mock_client_ctx
+
+    obj = StorageObject(
+        query=TEST_URL,
         keep_local=False,
         retrieve=True,
         provider=provider,
     )
 
-    local_path2 = tmp_path / "download2" / "testfile"
-    local_path2.parent.mkdir(parents=True, exist_ok=True)
-    obj2.local_path = lambda: local_path2
+    local_path = tmp_path / "out" / "test.json"
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+    obj.local_path = lambda: local_path
 
-    await obj2.managed_retrieve()
+    with pytest.warns(UserWarning, match="OID mismatch"):
+        await obj.managed_retrieve()
 
-    # Verify cache was populated
-    assert provider.cache is not None
-    cached_path = provider.cache.get(url)
-    assert cached_path is not None
-    assert cached_path.exists()
-
-    # The downloaded file should be the original, not the stale modified version
-    downloaded_content = cached_path.read_bytes()
-    assert b'"stale": true' not in downloaded_content
-    assert downloaded_content == original_content
+    # Should have downloaded the correct content
+    assert local_path.read_bytes() == TEST_CONTENT

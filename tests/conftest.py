@@ -5,25 +5,26 @@
 """Pytest configuration and shared fixtures."""
 
 from contextlib import contextmanager
+from unittest.mock import AsyncMock, patch
 
 
 @contextmanager
 def assert_no_http_requests(provider):
     """
-    Context manager that fails if any HTTP requests are made.
+    Context manager that fails if any HTTP requests are made via the provider's client.
 
     Usage:
         with assert_no_http_requests(storage_provider):
             await obj.managed_retrieve()  # Should use cache, not HTTP
     """
-    original_httpr = provider.httpr
+    original_client = provider.client
 
-    async def httpr_should_not_be_called(*args, **kwargs):
+    async def client_should_not_be_called(*args, **kwargs):
         raise AssertionError("HTTP request made when none was expected")
 
-    provider.httpr = httpr_should_not_be_called
+    provider.client = client_should_not_be_called
 
     try:
         yield
     finally:
-        provider.httpr = original_httpr
+        provider.client = original_client
