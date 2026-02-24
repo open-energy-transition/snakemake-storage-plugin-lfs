@@ -4,7 +4,7 @@
 
 """Tests for StorageProvider class methods and query validation."""
 
-from snakemake_storage_plugin_cached_http import StorageObject, StorageProvider
+from snakemake_storage_plugin_lfs import StorageObject, StorageProvider
 
 
 def test_import_storage_provider():

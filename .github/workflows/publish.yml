@@ -37,7 +37,7 @@ jobs:
     runs-on: ubuntu-latest
     environment:
       name: pypi
-      url: https://pypi.org/p/snakemake-storage-plugin-cached-http
+      url: https://pypi.org/p/snakemake-storage-plugin-lfs
     permissions:
       id-token: write
     steps:

@@ -46,7 +46,7 @@ requires = ["setuptools>=61.0", "setuptools-scm>=8.0"]
 build-backend = "setuptools.build_meta"
 
 [project.entry-points."snakemake_storage_plugins"]
-cached-http = "snakemake_storage_plugin_cached_http:StorageProvider"
+lfs = "snakemake_storage_plugin_lfs:StorageProvider"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

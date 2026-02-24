@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from snakemake_storage_plugin_cached_http import (
+from snakemake_storage_plugin_lfs import (
     FileMetadata,
     StorageObject,
     StorageProvider,
@@ -412,13 +412,12 @@ async def test_cache_stores_and_retrieves(storage_provider_with_cache, mock_lfs_
 
 @pytest.mark.asyncio
 async def test_local_repo_lookup(tmp_path, test_logger):
-    """Test that files are found in the local git LFS store."""
-    # Create a fake local repo with the LFS object
+    """Test that files are found in the local repo's working tree."""
+    # TEST_URL is lfs://{TEST_OID}/path/to/test.json, so lfs_path = "path/to/test.json"
     repo_dir = tmp_path / "repo"
-    lfs_obj_dir = repo_dir / ".git" / "lfs" / "objects" / TEST_OID[:2] / TEST_OID[2:4]
-    lfs_obj_dir.mkdir(parents=True)
-    lfs_obj_path = lfs_obj_dir / TEST_OID
-    lfs_obj_path.write_bytes(TEST_CONTENT)
+    checked_out_file = repo_dir / "path" / "to" / "test.json"
+    checked_out_file.parent.mkdir(parents=True)
+    checked_out_file.write_bytes(TEST_CONTENT)
 
     local_prefix = tmp_path / "local"
     local_prefix.mkdir()
@@ -434,18 +433,15 @@ async def test_local_repo_lookup(tmp_path, test_logger):
         settings=settings,
     )
 
-    # Verify _find_local_lfs_object finds it
-    found = provider._find_local_lfs_object(TEST_OID)
-    assert found is not None
-    assert found == lfs_obj_path
-
-    # Verify managed_retrieve uses the local object (no HTTP)
     obj = StorageObject(
         query=TEST_URL,
         keep_local=False,
         retrieve=True,
         provider=provider,
     )
+
+    # Verify _find_local_file finds the checked-out file
+    assert obj._find_local_file() == checked_out_file
 
     local_path = tmp_path / "out" / "test.json"
     local_path.parent.mkdir(parents=True, exist_ok=True)
@@ -459,16 +455,14 @@ async def test_local_repo_lookup(tmp_path, test_logger):
 
 @pytest.mark.asyncio
 async def test_local_repo_oid_mismatch_falls_through(tmp_path, test_logger, mock_lfs_server):
-    """Test that a local LFS object with wrong OID triggers a warning and falls through to download."""
+    """Test that a checked-out file with wrong content triggers a warning and falls through to download."""
     wrong_content = b"this is wrong content"
-    expected_oid = TEST_OID  # we still expect to download TEST_CONTENT
 
-    # Create a fake local repo with wrong content stored under the right OID path
+    # Create a fake local repo with wrong content at the expected path
     repo_dir = tmp_path / "repo"
-    lfs_obj_dir = repo_dir / ".git" / "lfs" / "objects" / TEST_OID[:2] / TEST_OID[2:4]
-    lfs_obj_dir.mkdir(parents=True)
-    lfs_obj_path = lfs_obj_dir / TEST_OID
-    lfs_obj_path.write_bytes(wrong_content)  # wrong content -> OID mismatch
+    checked_out_file = repo_dir / "path" / "to" / "test.json"
+    checked_out_file.parent.mkdir(parents=True)
+    checked_out_file.write_bytes(wrong_content)  # wrong content -> OID mismatch
 
     local_prefix = tmp_path / "local"
     local_prefix.mkdir()

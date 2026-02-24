@@ -3,105 +3,75 @@ SPDX-FileCopyrightText: Contributors to PyPSA-Eur <https://github.com/pypsa/pyps
 SPDX-License-Identifier: CC-BY-4.0
 -->
 
-# Snakemake Storage Plugin: Cached HTTP
+# Snakemake Storage Plugin: LFS
 
-A Snakemake storage plugin for downloading files via HTTP with local caching, checksum verification, and adaptive rate limiting.
-
-**Supported sources:**
-- **zenodo.org** - Zenodo data repository (checksum from API)
-- **data.pypsa.org** - PyPSA data repository (checksum from manifest.yaml)
-- **storage.googleapis.com** - Google Cloud Storage (checksum from GCS JSON API)
+A Snakemake storage plugin for downloading files from Git LFS (Large File Storage) servers with optional local caching.
 
 ## Features
 
-- **Local caching**: Downloads are cached to avoid redundant transfers (can be disabled)
-- **Checksum verification**: Automatically verifies checksums (from Zenodo API, data.pypsa.org manifests, or GCS object metadata)
-- **Rate limit handling**: Automatically respects Zenodo's rate limits using `X-RateLimit-*` headers with exponential backoff retry
-- **Concurrent download control**: Limits simultaneous downloads to prevent overwhelming servers
+- **Git LFS protocol**: Fetches objects via the [Git LFS Batch API](https://github.com/git-lfs/git-lfs/blob/main/docs/api/batch.md)
+- **Local repo lookup**: Checks a local git repository's LFS store before downloading remotely
+- **Local caching**: Downloaded objects can be cached to avoid redundant transfers
+- **Checksum verification**: Verifies SHA-256 integrity (the LFS OID *is* the SHA-256 digest)
+- **Authentication**: Supports token-based Basic Auth via environment variable
+- **Concurrent download control**: Limits simultaneous downloads
 - **Progress bars**: Shows download progress with tqdm
-- **Immutable URLs**: Returns mtime=0 for Zenodo and data.pypsa.org (persistent URLs); uses actual mtime for GCS
-- **Environment variable support**: Configure via environment variables for CI/CD workflows
+- **Immutable objects**: Returns mtime=0 (LFS objects are content-addressed and never change)
+- **Environment variable support**: Configure via environment variables for CI/CD
 
 ## Installation
 
-From the pypsa-eur repository root:
-
 ```bash
-pip install -e plugins/snakemake-storage-plugin-cached-http
+pip install snakemake-storage-plugin-lfs
+```
+
+## URL Format
+
+LFS objects are referenced using the `lfs://` scheme:
+
+```
+lfs://{oid}/{path}
+```
+
+- `{oid}` — SHA-256 hex digest of the object (64 hex characters)
+- `{path}` — logical file path used as the local filename
+
+**Example:**
+
+```
+lfs://3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b4/data/natura.tiff
 ```
 
 ## Configuration
 
-The Zenodo storage plugin works alongside other storage providers (like HTTP). Snakemake automatically routes URLs to the correct provider based on the URL pattern.
-
-Register additional settings in your Snakefile if you want to customize the defaults:
+Register the plugin in your Snakefile:
 
 ```python
-# Optional: Configure cached HTTP storage with custom settings
-# This extends the existing storage configuration (e.g., for HTTP)
-storage cached_http:
-    provider="cached-http",
-    cache="~/.cache/snakemake-pypsa-eur",  # Default location
-    max_concurrent_downloads=3,  # Download max 3 files at once
+storage lfs:
+    provider="lfs",
+    repo_url="https://github.com/org/repo",  # required
 ```
-
-If you don't explicitly configure it, the plugin will use default settings automatically.
 
 ### Settings
 
-- **cache** (optional): Cache directory for downloaded files
-  - Default: Platform-dependent user cache directory (via `platformdirs.user_cache_dir("snakemake-pypsa-eur")`)
-  - Set to `""` (empty string) to disable caching
-  - Files are cached here to avoid re-downloading
-  - Environment variable: `SNAKEMAKE_STORAGE_CACHED_HTTP_CACHE`
-
-- **skip_remote_checks** (optional): Skip metadata checking with remote API
-  - Default: `False` (perform checks)
-  - Set to `True` or `"1"` to skip remote existence/size checks (useful for CI/CD)
-  - Environment variable: `SNAKEMAKE_STORAGE_CACHED_HTTP_SKIP_REMOTE_CHECKS`
-
-- **max_concurrent_downloads** (optional): Maximum concurrent downloads
-  - Default: `3`
-  - Controls how many files can be downloaded simultaneously
-  - No environment variable support
+| Setting | Default | Env var | Description |
+|---------|---------|---------|-------------|
+| `repo_url` | `""` | `SNAKEMAKE_STORAGE_LFS_REPO_URL` | Git repository URL used to construct the LFS Batch API endpoint (e.g. `https://github.com/org/repo`). **Required.** |
+| `token_envvar` | `""` | — | Name of the environment variable containing the authentication token (used as Basic Auth password with username `git`). |
+| `local_repo` | `""` | `SNAKEMAKE_STORAGE_LFS_LOCAL_REPO` | Path to a local git repository. Files are looked up by path in the working tree before downloading remotely. If found but the SHA-256 hash does not match the OID, a warning is issued and the remote is used. |
+| `cache` | `""` | `SNAKEMAKE_STORAGE_LFS_CACHE` | Path to a cache directory for downloaded objects. Set to a path to enable caching; leave empty to disable. |
+| `skip_remote_checks` | `False` | `SNAKEMAKE_STORAGE_LFS_SKIP_REMOTE_CHECKS` | Skip existence/size checks against the remote LFS server. Useful in CI/CD when inputs are known to exist. |
+| `max_concurrent_downloads` | `3` | — | Maximum number of simultaneous downloads. |
 
 ## Usage
 
-Use Zenodo, data.pypsa.org, or Google Cloud Storage URLs directly in your rules. Snakemake automatically detects supported URLs and routes them to this plugin:
+Use `lfs://` URLs directly in your rules:
 
 ```python
-rule download_zenodo:
+rule use_lfs_file:
     input:
-        storage("https://zenodo.org/records/3520874/files/natura.tiff"),
-    output:
-        "resources/natura.tiff"
-    shell:
-        "cp {input} {output}"
-
-rule download_pypsa:
-    input:
-        storage("https://data.pypsa.org/workflows/eur/eez/v12_20231025/World_EEZ_v12_20231025_LR.zip"),
-    output:
-        "resources/eez.zip"
-    shell:
-        "cp {input} {output}"
-
-rule download_gcs:
-    input:
-        storage("https://storage.googleapis.com/open-tyndp-data-store/CBA_projects.zip"),
-    output:
-        "resources/cba_projects.zip"
-    shell:
-        "cp {input} {output}"
-```
-
-Or if you configured a tagged storage entity:
-
-```python
-rule download_data:
-    input:
-        storage.cached_http(
-            "https://zenodo.org/records/3520874/files/natura.tiff"
+        storage.lfs(
+            "lfs://3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b4/data/natura.tiff"
         ),
     output:
         "resources/natura.tiff"
@@ -110,57 +80,49 @@ rule download_data:
 ```
 
 The plugin will:
-1. Check if the file exists in the cache (if caching is enabled)
-2. If cached, copy from cache (fast)
-3. If not cached, download with:
-   - Progress bar showing download status
-   - Automatic rate limit handling with exponential backoff retry
-   - Concurrent download limiting
-   - Checksum verification (from Zenodo API, data.pypsa.org manifest, or GCS metadata)
-4. Store in cache for future use (if caching is enabled)
+1. Check the local git repository's LFS store (if `local_repo` is set)
+2. Check the local cache (if `cache` is set)
+3. If not found locally, query the LFS Batch API for a download URL
+4. Download the object with a progress bar
+5. Verify the SHA-256 checksum against the OID
+6. Store in the cache (if `cache` is set)
 
-### Example: CI/CD Configuration
+### Authentication
 
-For continuous integration environments where you want to skip caching and remote checks:
+To access private repositories, set `token_envvar` to the name of an environment variable that holds the token:
+
+```python
+storage lfs:
+    provider="lfs",
+    repo_url="https://github.com/org/private-repo",
+    token_envvar="GITHUB_TOKEN",
+```
+
+```bash
+export GITHUB_TOKEN="ghp_..."
+snakemake --cores all
+```
+
+### CI/CD Configuration
 
 ```yaml
 # GitHub Actions example
 - name: Run snakemake workflows
   env:
-    SNAKEMAKE_STORAGE_CACHED_HTTP_CACHE: ""
-    SNAKEMAKE_STORAGE_CACHED_HTTP_SKIP_REMOTE_CHECKS: "1"
+    SNAKEMAKE_STORAGE_LFS_REPO_URL: "https://github.com/org/repo"
+    SNAKEMAKE_STORAGE_LFS_SKIP_REMOTE_CHECKS: "1"
+    GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
   run: |
     snakemake --cores all
 ```
 
-## Rate Limiting and Retry
+## How LFS Objects Are Located
 
-Zenodo API limits:
-- **Guest users**: 60 requests/minute
-- **Authenticated users**: 100 requests/minute
+Priority order in `managed_retrieve()`:
 
-The plugin automatically:
-- Monitors `X-RateLimit-Remaining` header
-- Waits when rate limit is reached
-- Uses `X-RateLimit-Reset` to calculate wait time
-- Retries failed requests with exponential backoff (up to 5 attempts)
-- Handles transient errors: HTTP errors, timeouts, checksum mismatches, and network issues
-
-## URL Handling
-
-- Handles URLs from `zenodo.org`, `sandbox.zenodo.org`, `data.pypsa.org`, and `storage.googleapis.com`
-- Other HTTP(S) URLs are handled by the standard `snakemake-storage-plugin-http`
-- Both plugins can coexist in the same workflow
-
-### Plugin Priority
-
-When using `storage()` without specifying a plugin name, Snakemake checks all installed plugins:
-- **Cached HTTP plugin**: Only accepts zenodo.org, data.pypsa.org, and storage.googleapis.com URLs
-- **HTTP plugin**: Accepts all HTTP/HTTPS URLs (including zenodo.org)
-
-If both plugins are installed, supported URLs would be ambiguous - both plugins accept them.
-Typically snakemake would raise an error: **"Multiple suitable storage providers found"** if you try to use `storage()` without specifying which plugin to use, ie. one needs to explicitly call the Cached HTTP provider using `storage.cached_http(url)` instead of `storage(url)`,
-but we monkey-patch the http plugin to refuse zenodo.org, data.pypsa.org, and storage.googleapis.com URLs.
+1. **Local repo** (`local_repo` setting): Looks up the file by its path in the working tree (`{local_repo}/{lfs_path}`). The SHA-256 hash is verified against the OID; on mismatch a warning is issued and download proceeds.
+2. **Cache** (`cache` setting): Checks the configured cache directory.
+3. **Remote**: Queries the LFS Batch API (`{repo_url}.git/info/lfs/objects/batch`) and downloads from the returned URL.
 
 ## License
 

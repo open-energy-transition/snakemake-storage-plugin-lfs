@@ -317,27 +317,12 @@ class StorageProvider(StorageProviderBase):
         self._lfs_metadata_cache[oid] = metadata
         return metadata
 
-    def _find_local_lfs_object(self, oid: str) -> Path | None:
-        """
-        Look up a LFS object in the local git repository's LFS store.
-
-        Args:
-            oid: Git LFS object ID (SHA-256 hex digest)
-
-        Returns:
-            Path to the local LFS object file, or None if not found
-        """
+    def local_repo_path(self) -> Path | None:
+        """Return the resolved local repo path, or None if not configured."""
         local_repo = self.settings.local_repo
         if not local_repo:
             return None
-
-        repo_path = Path(local_repo).expanduser()
-        # Standard git-lfs storage: .git/lfs/objects/{oid[:2]}/{oid[2:4]}/{oid}
-        lfs_object = repo_path / ".git" / "lfs" / "objects" / oid[:2] / oid[2:4] / oid
-        if lfs_object.exists():
-            return lfs_object
-
-        return None
+        return Path(local_repo).expanduser()
 
 
 class StorageObject(StorageObjectRead):
@@ -371,13 +356,26 @@ class StorageObject(StorageObjectRead):
     def get_inventory_parent(self) -> str | None:
         return None
 
+    def _find_local_file(self) -> Path | None:
+        """
+        Look up the checked-out file in the local git repository's working tree.
+
+        Returns the path if the file exists, regardless of whether its content
+        matches the expected OID. Callers should verify the checksum themselves.
+        """
+        repo_path = self.provider.local_repo_path()
+        if repo_path is None:
+            return None
+        candidate = repo_path / self.lfs_path
+        return candidate if candidate.exists() else None
+
     @override
     async def managed_exists(self) -> bool:
         if self.provider.settings.skip_remote_checks:
             return True
 
         # Check local repo first
-        if self.provider._find_local_lfs_object(self.oid) is not None:
+        if self._find_local_file() is not None:
             return True
 
         # Check cache
@@ -406,7 +404,7 @@ class StorageObject(StorageObjectRead):
                 return cached.stat().st_size
 
         # Check local repo
-        local_obj = self.provider._find_local_lfs_object(self.oid)
+        local_obj = self._find_local_file()
         if local_obj is not None:
             return local_obj.stat().st_size
 
@@ -426,7 +424,7 @@ class StorageObject(StorageObjectRead):
             return
 
         # Check local repo
-        local_obj = self.provider._find_local_lfs_object(self.oid)
+        local_obj = self._find_local_file()
         if local_obj is not None:
             cache.exists_in_storage[key] = True
             cache.mtime[key] = Mtime(storage=0)
@@ -512,10 +510,10 @@ class StorageObject(StorageObjectRead):
         filename = self.lfs_path.split("/")[-1] if self.lfs_path else self.oid[:12]
 
         # 1. Try local repo first
-        local_obj = self.provider._find_local_lfs_object(self.oid)
+        local_obj = self._find_local_file()
         if local_obj is not None:
             copied = self._copy_from_source(
-                local_obj, local_path, f"local repo object {self.oid[:12]}"
+                local_obj, local_path, f"local repo file {self.lfs_path}"
             )
             if copied:
                 logger.info(f"Retrieved {filename} from local repo ({self.oid[:12]})")
@@ -579,6 +577,7 @@ class StorageObject(StorageObjectRead):
                             pbar.update(len(chunk))
 
             self.verify_checksum(local_path)
+            logger.info(f"Retrieved {filename} from remote ({self.oid[:12]})")
 
             if self.provider.cache:
                 self.provider.cache.put(query, local_path)
