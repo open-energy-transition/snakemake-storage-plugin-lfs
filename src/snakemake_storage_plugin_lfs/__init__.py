@@ -213,8 +213,12 @@ class StorageProvider(StorageProviderBase):
             auth = None
             if self.settings.token_envvar:
                 token = os.environ.get(self.settings.token_envvar, "")
-                if token:
-                    auth = httpx.BasicAuth(username="git", password=token)
+                if not token:
+                    raise WorkflowError(
+                        f"token_envvar is set to '{self.settings.token_envvar}' "
+                        f"but that environment variable is not set or empty."
+                    )
+                auth = httpx.BasicAuth(username="git", password=token)
 
             self._client = httpx.AsyncClient(
                 follow_redirects=True, limits=limits, timeout=timeout, auth=auth
