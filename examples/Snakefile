@@ -1,0 +1,24 @@
+# SPDX-FileCopyrightText: Contributors to PyPSA-Eur <https://github.com/pypsa/pypsa-eur>
+# SPDX-License-Identifier: MIT
+
+storage lfs:
+    provider="lfs",
+    repo_url="https://dev-gitlab.planet.transnetbw.com/oet/oet-repo-i-data",
+    local_repo="../input-data/oet-repo-i-data",
+    token_envvar="GITLAB_ACCESS_TOKEN",
+
+
+rule all:
+    input:
+        "results/costs_2030.csv",
+
+
+rule get_costs:
+    input:
+        storage.lfs(
+            "lfs://42c848533b67142ec04b7c82abcd26273b5edae83a3feb6b9631d42a767e03cb/costs/v0.10.1/costs_2030.csv"
+        ),
+    output:
+        "results/costs_2030.csv",
+    shell:
+        "cp {input} {output}"
