@@ -5,8 +5,8 @@
 import hashlib
 import os
 import shutil
-import warnings
 from contextlib import asynccontextmanager
+from functools import cached_property
 from dataclasses import dataclass, field
 from logging import Logger
 from pathlib import Path
@@ -360,18 +360,26 @@ class StorageObject(StorageObjectRead):
     def get_inventory_parent(self) -> str | None:
         return None
 
-    def _find_local_file(self) -> Path | None:
+    @cached_property
+    def local_repo_file(self) -> Path | None:
         """
         Look up the checked-out file in the local git repository's working tree.
 
-        Returns the path if the file exists, regardless of whether its content
-        matches the expected OID. Callers should verify the checksum themselves.
+        Returns the path if the file exists and is not an LFS pointer stub.
+        Callers should verify the checksum themselves.
         """
         repo_path = self.provider.local_repo_path()
         if repo_path is None:
             return None
         candidate = repo_path / self.lfs_path
-        return candidate if candidate.exists() else None
+        if not candidate.exists():
+            return None
+        # Skip LFS pointer stubs (file not yet pulled)
+        with candidate.open("rb") as f:
+            if f.read(43) == b"version https://git-lfs.github.com/spec/v1\n":
+                logger.warning(f"Skipping LFS pointer stub in local repo: {self.lfs_path}")
+                return None
+        return candidate
 
     @override
     async def managed_exists(self) -> bool:
@@ -379,7 +387,7 @@ class StorageObject(StorageObjectRead):
             return True
 
         # Check local repo first
-        if self._find_local_file() is not None:
+        if self.local_repo_file is not None:
             return True
 
         # Check cache
@@ -408,7 +416,7 @@ class StorageObject(StorageObjectRead):
                 return cached.stat().st_size
 
         # Check local repo
-        local_obj = self._find_local_file()
+        local_obj = self.local_repo_file
         if local_obj is not None:
             return local_obj.stat().st_size
 
@@ -428,7 +436,7 @@ class StorageObject(StorageObjectRead):
             return
 
         # Check local repo
-        local_obj = self._find_local_file()
+        local_obj = self.local_repo_file
         if local_obj is not None:
             cache.exists_in_storage[key] = True
             cache.mtime[key] = Mtime(storage=0)
@@ -494,10 +502,9 @@ class StorageObject(StorageObjectRead):
         try:
             self.verify_checksum(source)
         except WrongChecksum as e:
-            warnings.warn(
+            logger.warning(
                 f"OID mismatch for {label}: expected {e.expected}, got {e.observed}. "
-                "Falling through to remote download.",
-                stacklevel=2,
+                "Falling through to remote download."
             )
             return False
 
@@ -514,7 +521,7 @@ class StorageObject(StorageObjectRead):
         filename = self.lfs_path.split("/")[-1] if self.lfs_path else self.oid[:12]
 
         # 1. Try local repo first
-        local_obj = self._find_local_file()
+        local_obj = self.local_repo_file
         if local_obj is not None:
             copied = self._copy_from_source(
                 local_obj, local_path, f"local repo file {self.lfs_path}"

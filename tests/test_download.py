@@ -440,8 +440,8 @@ async def test_local_repo_lookup(tmp_path, test_logger):
         provider=provider,
     )
 
-    # Verify _find_local_file finds the checked-out file
-    assert obj._find_local_file() == checked_out_file
+    # Verify local_repo_file resolves to the checked-out file
+    assert obj.local_repo_file == checked_out_file
 
     local_path = tmp_path / "out" / "test.json"
     local_path.parent.mkdir(parents=True, exist_ok=True)
@@ -453,8 +453,39 @@ async def test_local_repo_lookup(tmp_path, test_logger):
     assert local_path.read_bytes() == TEST_CONTENT
 
 
+def test_local_repo_lfs_pointer_ignored(tmp_path, test_logger):
+    """Test that an LFS pointer stub in the working tree is treated as not found."""
+    repo_dir = tmp_path / "repo"
+    pointer_file = repo_dir / "path" / "to" / "test.json"
+    pointer_file.parent.mkdir(parents=True)
+    pointer_file.write_bytes(
+        b"version https://git-lfs.github.com/spec/v1\n"
+        b"oid sha256:" + TEST_OID.encode() + b"\n"
+        b"size 29\n"
+    )
+
+    settings = StorageProviderSettings(
+        repo_url="https://github.com/org/repo",
+        local_repo=str(repo_dir),
+        cache="",
+    )
+    provider = StorageProvider(
+        local_prefix=tmp_path / "local",
+        logger=test_logger,
+        settings=settings,
+    )
+    obj = StorageObject(
+        query=TEST_URL,
+        keep_local=False,
+        retrieve=True,
+        provider=provider,
+    )
+
+    assert obj.local_repo_file is None
+
+
 @pytest.mark.asyncio
-async def test_local_repo_oid_mismatch_falls_through(tmp_path, test_logger, mock_lfs_server):
+async def test_local_repo_oid_mismatch_falls_through(tmp_path, test_logger, mock_lfs_server, caplog):
     """Test that a checked-out file with wrong content triggers a warning and falls through to download."""
     wrong_content = b"this is wrong content"
 
@@ -506,8 +537,10 @@ async def test_local_repo_oid_mismatch_falls_through(tmp_path, test_logger, mock
     local_path.parent.mkdir(parents=True, exist_ok=True)
     obj.local_path = lambda: local_path
 
-    with pytest.warns(UserWarning, match="OID mismatch"):
+    with caplog.at_level(logging.WARNING):
         await obj.managed_retrieve()
+
+    assert any("OID mismatch" in r.message for r in caplog.records)
 
     # Should have downloaded the correct content
     assert local_path.read_bytes() == TEST_CONTENT
