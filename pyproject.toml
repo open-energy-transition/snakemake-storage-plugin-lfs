@@ -18,7 +18,7 @@ dependencies = [
     "reretry ~= 0.11",
     "snakemake-interface-common ~= 1.14",
     "snakemake-interface-storage-plugins >=4.2,<5.0",
-    "tqdm-loggable ~= 0.3",
+    "tqdm-loggable >=0.2,<1",
     "typing-extensions ~= 4.15",
     "zstandard ~=0.25.0",
 ]
