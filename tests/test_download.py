@@ -329,6 +329,7 @@ async def test_download_and_checksum(storage_object, mock_lfs_server, tmp_path):
     )
 
     mock_client = MagicMock()
+    mock_client.post = mock_lfs_server["mock_post"]
     mock_client.stream = mock_lfs_server["mock_stream"]
 
     @asynccontextmanager
@@ -378,6 +379,7 @@ async def test_cache_stores_and_retrieves(storage_provider_with_cache, mock_lfs_
     )
 
     mock_client = MagicMock()
+    mock_client.post = mock_lfs_server["mock_post"]
     mock_client.stream = mock_lfs_server["mock_stream"]
 
     @asynccontextmanager
@@ -454,6 +456,94 @@ async def test_local_repo_lookup(tmp_path, test_logger):
     assert local_path.read_bytes() == TEST_CONTENT
 
 
+def make_mock_client(content: bytes, fail_at: int | None, oid: str):
+    """
+    Factory for a mock httpx client simulating a range-capable HTTP server.
+
+    Args:
+        content: The full file content to serve.
+        fail_at: If set, drop the connection after serving this many bytes on the
+            first (non-Range) request, simulating a mid-transfer interruption.
+            If None, serve the full content without interruption.
+        oid: Expected OID (used to build a valid batch API response).
+    """
+    received_range_headers: list[str | None] = []
+
+    async def mock_post(url, **kwargs):
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = make_lfs_batch_response(
+            oid, TEST_DOWNLOAD_URL, len(content)
+        )
+        return resp
+
+    @asynccontextmanager
+    async def mock_stream(method, url, **kwargs):
+        range_header = (kwargs.get("headers") or {}).get("Range")
+        received_range_headers.append(range_header)
+
+        resp = MagicMock()
+        if range_header is None:
+            resp.status_code = 200
+            chunk = content
+            drop_at = fail_at
+        else:
+            resp.status_code = 206
+            offset = int(range_header.removeprefix("bytes=").removesuffix("-"))
+            chunk = content[offset:]
+            drop_at = None
+
+        async def aiter_bytes(chunk_size=8192):
+            if drop_at is None:
+                yield chunk
+            else:
+                yield chunk[:drop_at]
+                raise ConnectionError("peer closed connection")
+
+        resp.aiter_bytes = aiter_bytes
+        resp.headers = {"content-length": str(len(chunk))}
+        yield resp
+
+    mock_client = MagicMock()
+    mock_client.post = mock_post
+    mock_client.stream = mock_stream
+
+    @asynccontextmanager
+    async def mock_client_ctx():
+        yield mock_client
+
+    mock_client_ctx.received_range_headers = received_range_headers
+    return mock_client_ctx
+
+
+@pytest.mark.asyncio
+async def test_resume_on_partial_file(storage_provider, tmp_path):
+    """Test that downloads resume from partial files using HTTP Range requests."""
+    fail_at = 10
+    mock_client_ctx = make_mock_client(
+        TEST_CONTENT, fail_at=fail_at, oid=TEST_OID
+    )
+    storage_provider.client = mock_client_ctx
+
+    obj = StorageObject(
+        query=TEST_URL,
+        keep_local=False,
+        retrieve=True,
+        provider=storage_provider,
+    )
+
+    local_path = tmp_path / "resume_test" / "test.json"
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+    obj.local_path = lambda: local_path
+
+    await obj.managed_retrieve()
+
+    assert len(mock_client_ctx.received_range_headers) == 2
+    assert mock_client_ctx.received_range_headers[0] is None  # first attempt: no Range header
+    assert mock_client_ctx.received_range_headers[1] == f"bytes={fail_at}-"  # resume from interruption point
+    assert local_path.read_bytes() == TEST_CONTENT
+
+
 def test_local_repo_lfs_pointer_ignored(tmp_path, test_logger):
     """Test that an LFS pointer stub in the working tree is treated as not found."""
     repo_dir = tmp_path / "repo"
@@ -519,5 +609,5 @@ async def test_local_repo_oid_mismatch_raises(tmp_path, test_logger):
     local_path.parent.mkdir(parents=True, exist_ok=True)
     obj.local_path = lambda: local_path
 
-    with pytest.raises(WorkflowError, match="different version"):
+    with pytest.raises(WorkflowError, match="different content"):
         await obj.managed_retrieve()
