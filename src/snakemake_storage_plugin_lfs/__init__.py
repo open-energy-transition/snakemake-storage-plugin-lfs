@@ -7,6 +7,7 @@ import os
 import shutil
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from functools import cached_property
 from logging import Logger
 from pathlib import Path
@@ -101,6 +102,12 @@ class StorageProviderSettings(SettingsBase):
     )
 
 
+def utc_after(hours: float = 0, minutes: float = 0, seconds: float = 0) -> datetime:
+    return datetime.now(timezone.utc) + timedelta(
+        hours=hours, minutes=minutes, seconds=seconds
+    )
+
+
 @dataclass
 class FileMetadata:
     """Metadata for a file from the LFS batch API."""
@@ -109,6 +116,7 @@ class FileMetadata:
     size: int
     download_url: str | None = None
     download_headers: dict[str, str] = field(default_factory=dict)
+    expires_at: datetime = field(default_factory=lambda: utc_after(hours=1))
 
 
 class WrongChecksum(Exception):
@@ -253,7 +261,9 @@ class StorageProvider(StorageProviderBase):
             FileMetadata with download URL, headers, checksum, and size
         """
         if oid in self._lfs_metadata_cache:
-            return self._lfs_metadata_cache[oid]
+            cached = self._lfs_metadata_cache[oid]
+            if cached.expires_at >= utc_after(minutes=5):
+                return cached
 
         batch_url = self._lfs_batch_api_url()
         payload = {
@@ -311,11 +321,19 @@ class StorageProvider(StorageProviderBase):
         download_url: str | None = download.get("href")
         download_headers: dict[str, str] = download.get("header", {})
 
+        if expires_in := download.get("expires_in"):
+            expires_at = utc_after(seconds=float(expires_in))
+        elif expires_at_str := download.get("expires_at"):
+            expires_at = datetime.fromisoformat(expires_at_str).astimezone(timezone.utc)
+        else:
+            expires_at = utc_after(hours=1)
+
         metadata = FileMetadata(
             checksum=f"sha256:{oid}",
             size=size,
             download_url=download_url,
             download_headers=download_headers,
+            expires_at=expires_at,
         )
 
         self._lfs_metadata_cache[oid] = metadata
@@ -552,29 +570,42 @@ class StorageObject(StorageObjectRead):
                 f"No download URL returned by LFS batch API for OID {self.oid}"
             )
 
+        # Check for existing partial file to resume
+        offset = local_path.stat().st_size if local_path.exists() else 0
+        headers = dict(metadata.download_headers)
+        if offset > 0:
+            headers["Range"] = f"bytes={offset}-"
+
         try:
             async with (
                 self.provider.client() as client,
-                client.stream(
-                    "get", download_url, headers=metadata.download_headers
-                ) as response,
+                client.stream("get", download_url, headers=headers) as response,
             ):
-                if response.status_code >= 500:
+                if response.status_code == 206:
+                    # Server supports resume — append to existing partial file
+                    mode = "ab"
+                    logger.info(f"Resuming {filename} from byte {offset}")
+                elif response.status_code == 200:
+                    # Server does not support Range — discard partial and restart
+                    mode = "wb"
+                    offset = 0
+                elif response.status_code >= 500:
                     raise httpx.HTTPStatusError(
                         f"Failed to download LFS object: HTTP {response.status_code} ({download_url})",
                         request=response.request,
                         response=response,
                     )
-                if response.status_code != 200:
+                else:
                     raise WorkflowError(
                         f"Failed to download LFS object: HTTP {response.status_code} ({download_url})"
                     )
 
-                total_size = int(response.headers.get("content-length", 0))
+                total_size = int(response.headers.get("content-length", 0)) + offset
 
-                with local_path.open(mode="wb") as f:
+                with local_path.open(mode=mode) as f:
                     with tqdm(
                         total=total_size,
+                        initial=offset,
                         unit="B",
                         unit_scale=True,
                         desc=filename,
@@ -591,6 +622,9 @@ class StorageObject(StorageObjectRead):
             if self.provider.cache:
                 self.provider.cache.put(query, local_path)
 
+        except (TimeoutError, ConnectionError, httpx.TransportError):
+            # Mid-transfer interruption — keep partial file for resume on next retry
+            raise
         except:
             if local_path.exists():
                 local_path.unlink()
