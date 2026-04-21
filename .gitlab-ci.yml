@@ -3,13 +3,28 @@
 # SPDX-License-Identifier: MIT
 
 stages:
+  - test
   - build
   - publish
 
 .install-uv: &install-uv
   image: python:3.12-bookworm
   before_script:
-    - curl -LsSf https://astral.sh/uv/install.sh | UV_INSTALL_DIR=/usr/local/bin sh
+    - test -f .cache/bin/uv || (mkdir -p .cache/bin && curl -LsSf https://astral.sh/uv/install.sh | UV_INSTALL_DIR=$CI_PROJECT_DIR/.cache/bin sh)
+    - export PATH="$CI_PROJECT_DIR/.cache/bin:$PATH"
+  cache:
+    key: uv
+    paths:
+      - .cache/bin/
+      - .cache/uv/
+  variables:
+    UV_CACHE_DIR: $CI_PROJECT_DIR/.cache/uv
+
+test:
+  <<: *install-uv
+  stage: test
+  script:
+    - uv run pytest
 
 build:
   <<: *install-uv
