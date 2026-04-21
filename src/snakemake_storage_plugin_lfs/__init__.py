@@ -381,14 +381,26 @@ class StorageObject(StorageObjectRead):
     @cached_property
     def local_repo_file(self) -> Path | None:
         """
-        Look up the checked-out file in the local git repository's working tree.
+        Look up the file in the local git repository.
 
-        Returns the path if the file exists and is not an LFS pointer stub.
+        For bare repos, checks the LFS object store directly by OID.
+        For working-tree repos, checks the checked-out file (skipping pointer stubs).
         Callers should verify the checksum themselves.
+
+        Returns the path to the file or None
         """
         repo_path = self.provider.local_repo_path()
         if repo_path is None:
             return None
+
+        # Bare repo: look up LFS blob by OID directly
+        if (repo_path / "HEAD").exists() and not (repo_path / ".git").exists():
+            lfs_blob = (
+                repo_path / "lfs" / "objects" / self.oid[:2] / self.oid[2:4] / self.oid
+            )
+            return lfs_blob if lfs_blob.exists() else None
+
+        # Working tree repo: check the checked-out file
         candidate = repo_path / self.lfs_path
         if not candidate.exists():
             return None
