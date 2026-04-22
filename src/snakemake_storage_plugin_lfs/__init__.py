@@ -4,7 +4,6 @@
 
 import hashlib
 import os
-import shutil
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -31,6 +30,7 @@ from tqdm_loggable.auto import tqdm
 from typing_extensions import override
 
 from .cache import Cache
+from .common import link_or_copy
 
 logger = get_logger()
 
@@ -550,7 +550,7 @@ class StorageObject(StorageObjectRead):
                     f"  Expected OID: {e.expected}\n"
                     f"  Found OID:    {e.observed}"
                 ) from e
-            shutil.copy2(local_file, local_path)
+            link_or_copy(local_file, local_path)
             logger.info(f"Retrieved {filename} from local repo ({self.oid[:12]})")
             return
 
@@ -560,7 +560,7 @@ class StorageObject(StorageObjectRead):
             if cached is not None:
                 try:
                     self.verify_checksum(cached)
-                    shutil.copy2(cached, local_path)
+                    link_or_copy(cached, local_path)
                     logger.info(f"Retrieved {filename} from cache ({self.oid[:12]})")
                     return
                 except WrongChecksum as e:
