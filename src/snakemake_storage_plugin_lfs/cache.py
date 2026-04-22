@@ -2,12 +2,13 @@
 #
 # SPDX-License-Identifier: MIT
 
-import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
 
 from snakemake_interface_common.logging import get_logger
+
+from .common import link_or_copy
 
 logger = get_logger()
 
@@ -54,5 +55,5 @@ class Cache:
         """
         cache_path = self._get_cache_path(url)
         cache_path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(filepath, cache_path)
+        link_or_copy(filepath, cache_path, may_symlink=False)
         logger.info(f"Cached {filepath.name} to {self.cache_dir}")
