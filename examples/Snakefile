@@ -3,7 +3,7 @@
 
 storage lfs:
     provider="lfs",
-    repo_url="https://dev-gitlab.planet.transnetbw.com/oet/oet-repo-i-data",
+    repo_url="https://gitlab.transnetbw.com/planet-esm/oet/data/oet-repo-i-data",
     local_repo="../../input-data/oet-repo-i-data",
     token_envvar="GITLAB_ACCESS_TOKEN",
 
@@ -11,14 +11,24 @@ storage lfs:
 rule all:
     input:
         "results/costs_2030.csv",
+        "results/eez.zip",
+
+
+rule get_eez:
+    input:
+        storage(
+            "lfs://f0b1b18/eez/v12_20231025/World_EEZ_v12_20231025_LR.zip"
+        ),
+    output:
+        "results/eez.zip",
+    shell:
+        "mv {input} {output}"
 
 
 rule get_costs:
     input:
-        storage(
-            "lfs://42c848533b67142ec04b7c82abcd26273b5edae83a3feb6b9631d42a767e03cb/costs/v0.10.1/costs_2030.csv"
-        ),
+        storage("lfs://f0b1b18/costs/v0.10.1/costs_2030.csv"),
     output:
         "results/costs_2030.csv",
     shell:
-        "cp {input} {output}"
+        "mv {input} {output}"
