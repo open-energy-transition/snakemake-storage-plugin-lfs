@@ -22,7 +22,10 @@ def test_storage_provider_has_required_methods():
 
 
 def test_is_valid_query_lfs():
-    result = StorageProvider.is_valid_query("lfs://abc123def456abcdef/path/to/file.csv")
+    result = StorageProvider.is_valid_query("lfs://v1.2.3/path/to/file.csv")
+    assert result.valid is True
+
+    result = StorageProvider.is_valid_query("lfs://abc1234/path/to/file.csv")
     assert result.valid is True
 
 
