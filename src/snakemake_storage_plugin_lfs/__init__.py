@@ -488,8 +488,8 @@ class StorageObject(StorageObjectRead):
 
         # Regular file (not LFS)
         if pointer.oid is None:
-            assert pointer.tmp_file is not None
-            link_or_copy(Path(pointer.tmp_file.name), local_path, may_symlink=False)
+            assert pointer.tmp_path is not None
+            link_or_copy(pointer.tmp_path, local_path, may_symlink=False)
             if self.provider.cache:
                 self.provider.cache.put(query, local_path)
             logger.info(f"Retrieved {filename} (regular git file)")

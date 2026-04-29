@@ -6,6 +6,7 @@
 
 import hashlib
 import logging
+from pathlib import Path
 from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock, MagicMock
 
@@ -456,14 +457,11 @@ async def test_local_lfs_object_lookup(tmp_path, test_logger):
 @pytest.mark.asyncio
 async def test_regular_file_retrieve(storage_provider, tmp_path):
     """Test that regular (non-LFS) git files are written directly."""
-    import tempfile
-
-    tmp = tempfile.NamedTemporaryFile(delete=True)
-    tmp.write(TEST_CONTENT)
-    tmp.flush()
+    regular_file_path = tmp_path / "regular_file.json"
+    regular_file_path.write_bytes(TEST_CONTENT)
 
     storage_provider.pointer_cache[(TEST_REF, TEST_PATH)] = PointerMetadata(
-        oid=None, size=len(TEST_CONTENT), tmp_file=tmp
+        oid=None, size=len(TEST_CONTENT), tmp_path=regular_file_path
     )
 
     obj = StorageObject(

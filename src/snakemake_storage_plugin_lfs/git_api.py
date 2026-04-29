@@ -3,14 +3,14 @@
 # SPDX-License-Identifier: MIT
 
 import os
-import subprocess
 import tempfile
+import weakref
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import IO
 from urllib.parse import urlparse
 
+import git
 import httpx
 from snakemake_interface_common.exceptions import WorkflowError
 
@@ -21,9 +21,9 @@ LFS_POINTER_HEADER = b"version https://git-lfs.github.com/spec/v1\n"
 class PointerMetadata:
     """Resolved metadata for a file at a given git ref and path."""
 
-    oid: str | None  # sha256 hex; empty string for regular (non-LFS) files
+    oid: str | None  # sha256 hex; None for regular (non-LFS) files
     size: int
-    tmp_file: IO[bytes] | None = field(default=None, repr=False)
+    tmp_path: Path | None = field(default=None, repr=False)
 
 
 def _parse_blob(raw: bytes, path: str) -> PointerMetadata:
@@ -39,12 +39,14 @@ def _parse_blob(raw: bytes, path: str) -> PointerMetadata:
             raise WorkflowError(f"Malformed LFS pointer: {raw[:200]!r}")
         return PointerMetadata(oid=oid, size=size)
 
-    tmp = tempfile.NamedTemporaryFile(
-        suffix="_" + os.path.basename(path), delete_on_close=False
-    )
-    with tmp:
+    with tempfile.NamedTemporaryFile(
+        suffix="_" + os.path.basename(path), delete=False
+    ) as tmp:
         tmp.write(raw)
-    return PointerMetadata(oid=None, size=len(raw), tmp_file=tmp)
+    tmp_path = Path(tmp.name)
+    meta = PointerMetadata(oid=None, size=len(raw), tmp_path=tmp_path)
+    weakref.finalize(meta, tmp_path.unlink, missing_ok=True)
+    return meta
 
 
 @dataclass
@@ -52,14 +54,12 @@ class LocalGitProvider:
     repo_path: Path
 
     async def get_pointer_metadata(self, ref: str, path: str) -> PointerMetadata | None:
-        result = subprocess.run(
-            ["git", "cat-file", "blob", f"{ref}:{path}"],
-            cwd=self.repo_path,
-            capture_output=True,
-        )
-        if result.returncode != 0:
+        try:
+            repo = git.Repo(self.repo_path)
+            blob = repo.commit(ref).tree[path]
+            return _parse_blob(blob.data_stream.read(), path=path)
+        except (git.BadName, git.BadObject, KeyError):
             return None
-        return _parse_blob(result.stdout, path=path)
 
     def find_lfs_object(self, oid: str) -> Path | None:
         """Look up an LFS object by OID in a local repo's LFS object store."""
