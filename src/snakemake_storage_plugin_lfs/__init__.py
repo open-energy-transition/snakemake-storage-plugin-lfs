@@ -2,12 +2,12 @@
 #
 # SPDX-License-Identifier: MIT
 
+import base64
 import hashlib
 import os
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from functools import cached_property
 from logging import Logger
 from pathlib import Path
 from urllib.parse import urlparse
@@ -31,6 +31,7 @@ from typing_extensions import override
 
 from .cache import Cache
 from .common import link_or_copy
+from .git_api import GitApiProvider, LocalGitProvider, PointerMetadata
 
 logger = get_logger()
 
@@ -61,21 +62,21 @@ class StorageProviderSettings(SettingsBase):
     repo_url: str = field(
         default="",
         metadata={
-            "help": "Git repository URL used to construct the LFS batch API endpoint (e.g. https://github.com/org/repo).",
+            "help": "Git repository URL used to construct the LFS batch API endpoint and resolve file pointers (e.g. https://github.com/org/repo).",
             "env_var": True,
         },
     )
     token_envvar: str = field(
         default="",
         metadata={
-            "help": "Name of the environment variable containing the authentication token for the LFS server (used as Basic Auth password).",
+            "help": "Name of the environment variable containing the authentication token for the git host and LFS server.",
             "env_var": False,
         },
     )
     local_repo: str = field(
         default="",
         metadata={
-            "help": "Path to a local git repository to look up LFS objects before downloading. If the OID is found locally but the hash does not match, a warning is issued.",
+            "help": "Path to a local git repository. Used to resolve file pointers and look up LFS objects before downloading.",
             "env_var": True,
         },
     )
@@ -109,14 +110,12 @@ def utc_after(hours: float = 0, minutes: float = 0, seconds: float = 0) -> datet
 
 
 @dataclass
-class FileMetadata:
-    """Metadata for a file from the LFS batch API."""
+class DownloadMetadata:
+    """LFS batch API response for a single object."""
 
-    checksum: str | None  # "sha256:{hexdigest}"
-    size: int
-    download_url: str | None = None
-    download_headers: dict[str, str] = field(default_factory=dict)
-    expires_at: datetime = field(default_factory=lambda: utc_after(hours=1))
+    url: str
+    headers: dict[str, str]
+    expires_at: datetime
 
 
 class WrongChecksum(Exception):
@@ -151,9 +150,20 @@ def is_lfs_url(query: str) -> bool:
 class StorageProvider(StorageProviderBase):
     settings: StorageProviderSettings
     cache: Cache | None
+    token: str | None
+    local_git: LocalGitProvider | None
+    remote_git: GitApiProvider
+
+    pointer_cache: dict[tuple[str, str], PointerMetadata | None]
+    download_cache: dict[str, DownloadMetadata]
 
     def __post_init__(self):
         super().__post_init__()
+
+        if not self.settings.repo_url:
+            raise WorkflowError(
+                "repo_url must be set in StorageProviderSettings to use the LFS storage plugin"
+            )
 
         self.cache = (
             Cache(cache_dir=Path(self.settings.cache)) if self.settings.cache else None
@@ -162,8 +172,28 @@ class StorageProvider(StorageProviderBase):
         self._client: httpx.AsyncClient | None = None
         self._client_refcount: int = 0
 
-        # Cache for LFS batch API results: oid -> FileMetadata
-        self._lfs_metadata_cache: dict[str, FileMetadata] = {}
+        if self.settings.token_envvar:
+            token = os.environ.get(self.settings.token_envvar) or None
+            if token is None:
+                raise WorkflowError(
+                    f"token_envvar is set to '{self.settings.token_envvar}' "
+                    f"but that environment variable is not set or empty."
+                )
+        else:
+            token = None
+        self.token = token
+
+        self.local_git = (
+            LocalGitProvider(Path(self.settings.local_repo).expanduser())
+            if self.settings.local_repo
+            else None
+        )
+        self.remote_git = GitApiProvider.from_repo_url(
+            self.settings.repo_url, token=token
+        )
+
+        self.pointer_cache = {}
+        self.download_cache = {}
 
     @override
     def use_rate_limiter(self) -> bool:
@@ -182,8 +212,13 @@ class StorageProvider(StorageProviderBase):
     def example_queries(cls) -> list[ExampleQuery]:
         return [
             ExampleQuery(
-                query="lfs://abc123def456/path/to/file.csv",
-                description="A Git LFS object by OID and path",
+                query="lfs://v1.2.3/path/to/file.csv",
+                description="A file in a Git LFS repository at a given tag",
+                type=QueryType.INPUT,
+            ),
+            ExampleQuery(
+                query="lfs://abc1234/path/to/file.csv",
+                description="A file in a Git LFS repository at a given commit",
                 type=QueryType.INPUT,
             ),
         ]
@@ -217,19 +252,8 @@ class StorageProvider(StorageProviderBase):
                 max_connections=max_concurrent_downloads,
             )
             timeout = httpx.Timeout(60, pool=None)
-
-            auth = None
-            if self.settings.token_envvar:
-                token = os.environ.get(self.settings.token_envvar, "")
-                if not token:
-                    raise WorkflowError(
-                        f"token_envvar is set to '{self.settings.token_envvar}' "
-                        f"but that environment variable is not set or empty."
-                    )
-                auth = httpx.BasicAuth(username="git", password=token)
-
             self._client = httpx.AsyncClient(
-                follow_redirects=True, limits=limits, timeout=timeout, auth=auth
+                follow_redirects=True, limits=limits, timeout=timeout
             )
 
         try:
@@ -241,27 +265,35 @@ class StorageProvider(StorageProviderBase):
                 self._client = None
 
     def _lfs_batch_api_url(self) -> str:
-        """Construct the LFS batch API URL from repo_url."""
         repo_url = self.settings.repo_url.rstrip("/")
-        if not repo_url:
-            raise WorkflowError(
-                "repo_url must be set in StorageProviderSettings to use the LFS storage plugin"
-            )
         return f"{repo_url}.git/info/lfs/objects/batch"
 
+    def _lfs_auth_headers(self) -> dict[str, str]:
+        if self.token is None:
+            return {}
+        encoded = base64.b64encode(f"git:{self.token}".encode()).decode()
+        return {"Authorization": f"Basic {encoded}"}
+
+    async def get_pointer_metadata(self, ref: str, path: str) -> PointerMetadata | None:
+        key = (ref, path)
+        if key in self.pointer_cache:
+            return self.pointer_cache[key]
+
+        if self.local_git and (
+            meta := await self.local_git.get_pointer_metadata(ref, path)
+        ):
+            self.pointer_cache[key] = meta
+            return meta
+
+        async with self.client() as client:
+            meta = await self.remote_git.get_pointer_metadata(client, ref, path)
+        self.pointer_cache[key] = meta
+        return meta
+
     @retry_decorator
-    async def get_metadata(self, oid: str) -> FileMetadata | None:
-        """
-        Retrieve file metadata via the Git LFS Batch API.
-
-        Args:
-            oid: Git LFS object ID (SHA-256 hex digest)
-
-        Returns:
-            FileMetadata with download URL, headers, checksum, and size
-        """
-        if oid in self._lfs_metadata_cache:
-            cached = self._lfs_metadata_cache[oid]
+    async def get_download_metadata(self, oid: str) -> DownloadMetadata | None:
+        if oid in self.download_cache:
+            cached = self.download_cache[oid]
             if cached.expires_at >= utc_after(minutes=5):
                 return cached
 
@@ -280,6 +312,7 @@ class StorageProvider(StorageProviderBase):
                     headers={
                         "Accept": "application/vnd.git-lfs+json",
                         "Content-Type": "application/vnd.git-lfs+json",
+                        **self._lfs_auth_headers(),
                     },
                 )
         except Exception as e:
@@ -306,7 +339,6 @@ class StorageProvider(StorageProviderBase):
 
         obj = objects[0]
 
-        # Check for error in object response
         if "error" in obj:
             err = obj["error"]
             code = err.get("code", "?")
@@ -315,11 +347,13 @@ class StorageProvider(StorageProviderBase):
                 return None
             raise WorkflowError(f"LFS batch API error for OID {oid}: {code} {msg}")
 
-        size: int = obj.get("size", 0)
         actions = obj.get("actions", {})
         download = actions.get("download", {})
         download_url: str | None = download.get("href")
         download_headers: dict[str, str] = download.get("header", {})
+
+        if not download_url:
+            return None
 
         if expires_in := download.get("expires_in"):
             expires_at = utc_after(seconds=float(expires_in))
@@ -328,112 +362,56 @@ class StorageProvider(StorageProviderBase):
         else:
             expires_at = utc_after(hours=1)
 
-        metadata = FileMetadata(
-            checksum=f"sha256:{oid}",
-            size=size,
-            download_url=download_url,
-            download_headers=download_headers,
+        metadata = DownloadMetadata(
+            url=download_url,
+            headers=download_headers,
             expires_at=expires_at,
         )
 
-        self._lfs_metadata_cache[oid] = metadata
+        self.download_cache[oid] = metadata
         return metadata
-
-    def local_repo_path(self) -> Path | None:
-        """Return the resolved local repo path, or None if not configured."""
-        local_repo = self.settings.local_repo
-        if not local_repo:
-            return None
-        return Path(local_repo).expanduser()
 
 
 class StorageObject(StorageObjectRead):
     provider: StorageProvider  # pyright: ignore[reportIncompatibleVariableOverride]
-    oid: str
+    ref: str
     lfs_path: str
 
     def __post_init__(self):
         super().__post_init__()
 
-        # Parse lfs://{oid}/{path}
         parsed = urlparse(str(self.query))
         if parsed.scheme != "lfs":
             raise WorkflowError(f"Invalid LFS URL scheme: {self.query}")
 
-        # netloc is the oid, path is the file path
-        self.oid = parsed.netloc
+        self.ref = parsed.netloc
         self.lfs_path = parsed.path.strip("/")
 
-        if not self.oid:
+        if not self.ref:
             raise WorkflowError(
-                f"Invalid LFS URL: {self.query}. Expected format: lfs://{{oid}}/{{path}}"
+                f"Invalid LFS URL: {self.query}. Expected format: lfs://{{ref}}/{{path}}"
             )
 
     @override
     def local_suffix(self) -> str:
-        """Return the local suffix for this object (used by parent class)."""
-        return f"{self.oid}/{self.lfs_path}"
+        return f"{self.ref}/{self.lfs_path}"
 
     @override
     def get_inventory_parent(self) -> str | None:
         return None
-
-    @cached_property
-    def local_repo_file(self) -> Path | None:
-        """
-        Look up the file in the local git repository.
-
-        For bare repos, checks the LFS object store directly by OID.
-        For working-tree repos, checks the checked-out file (skipping pointer stubs).
-        Callers should verify the checksum themselves.
-
-        Returns the path to the file or None
-        """
-        repo_path = self.provider.local_repo_path()
-        if repo_path is None:
-            return None
-
-        # Bare repo: look up LFS blob by OID directly
-        if (repo_path / "HEAD").exists() and not (repo_path / ".git").exists():
-            lfs_blob = (
-                repo_path / "lfs" / "objects" / self.oid[:2] / self.oid[2:4] / self.oid
-            )
-            return lfs_blob if lfs_blob.exists() else None
-
-        # Working tree repo: check the checked-out file
-        candidate = repo_path / self.lfs_path
-        if not candidate.exists():
-            return None
-        # Skip LFS pointer stubs (file not yet pulled)
-        with candidate.open("rb") as f:
-            if f.read(43) == b"version https://git-lfs.github.com/spec/v1\n":
-                logger.warning(
-                    f"Skipping LFS pointer stub in local repo: {self.lfs_path}"
-                )
-                return None
-        return candidate
 
     @override
     async def managed_exists(self) -> bool:
         if self.provider.settings.skip_remote_checks:
             return True
 
-        # Check local repo first
-        if self.local_repo_file is not None:
-            return True
-
-        # Check cache
-        if self.provider.cache:
-            cached = self.provider.cache.get(str(self.query))
-            if cached is not None:
-                return True
-
-        metadata = await self.provider.get_metadata(self.oid)
-        return metadata is not None
+        return (
+            await self.provider.get_pointer_metadata(self.ref, self.lfs_path)
+            is not None
+        )
 
     @override
     async def managed_mtime(self) -> float:
-        # LFS objects are immutable (content-addressed), always return 0
         return 0
 
     @override
@@ -447,13 +425,8 @@ class StorageObject(StorageObjectRead):
             if cached is not None:
                 return cached.stat().st_size
 
-        # Check local repo
-        local_obj = self.local_repo_file
-        if local_obj is not None:
-            return local_obj.stat().st_size
-
-        metadata = await self.provider.get_metadata(self.oid)
-        return metadata.size if metadata is not None else 0
+        pointer = await self.provider.get_pointer_metadata(self.ref, self.lfs_path)
+        return pointer.size if pointer is not None else 0
 
     @override
     async def inventory(self, cache: IOCacheStorageInterface) -> None:
@@ -467,33 +440,10 @@ class StorageObject(StorageObjectRead):
             cache.size[key] = 0
             return
 
-        # Check local repo
-        local_obj = self.local_repo_file
-        if local_obj is not None:
-            cache.exists_in_storage[key] = True
-            cache.mtime[key] = Mtime(storage=0)
-            cache.size[key] = local_obj.stat().st_size
-            return
-
-        # Check cache
-        if self.provider.cache:
-            cached = self.provider.cache.get(str(self.query))
-            if cached is not None:
-                cache.exists_in_storage[key] = True
-                cache.mtime[key] = Mtime(storage=0)
-                cache.size[key] = cached.stat().st_size
-                return
-
-        metadata = await self.provider.get_metadata(self.oid)
-        if metadata is None:
-            cache.exists_in_storage[key] = False
-            cache.mtime[key] = Mtime(storage=0)
-            cache.size[key] = 0
-            return
-
-        cache.exists_in_storage[key] = True
+        pointer = await self.provider.get_pointer_metadata(self.ref, self.lfs_path)
+        cache.exists_in_storage[key] = pointer is not None
         cache.mtime[key] = Mtime(storage=0)
-        cache.size[key] = metadata.size
+        cache.size[key] = pointer.size if pointer is not None else 0
 
     @override
     def cleanup(self):
@@ -515,101 +465,101 @@ class StorageObject(StorageObjectRead):
     def retrieve_object(self) -> None:
         raise NotImplementedError()
 
-    def verify_checksum(self, path: Path) -> None:
-        """
-        Verify `path` against the expected SHA-256 checksum (the OID).
-
-        Raises:
-            WrongChecksum
-        """
+    def verify_checksum(self, path: Path, oid: str) -> None:
         with open(path, "rb") as f:
-            checksum_observed = hashlib.file_digest(f, "sha256").hexdigest().lower()
-        checksum_expected = self.oid.lower()
-
-        if checksum_expected != checksum_observed:
-            raise WrongChecksum(observed=checksum_observed, expected=checksum_expected)
+            observed = hashlib.file_digest(f, "sha256").hexdigest().lower()
+        expected = oid.lower()
+        if expected != observed:
+            raise WrongChecksum(observed=observed, expected=expected)
 
     @retry_decorator
     async def managed_retrieve(self):
-        """Async download with concurrency control, local repo lookup, caching, and checksum verification."""
         local_path = self.local_path()
         local_path.parent.mkdir(parents=True, exist_ok=True)
 
+        filename = self.lfs_path.split("/")[-1] if self.lfs_path else self.ref[:12]
         query = str(self.query)
-        filename = self.lfs_path.split("/")[-1] if self.lfs_path else self.oid[:12]
 
-        # 1. Try local repo first
-        local_file = self.local_repo_file
-        if local_file is not None:
-            try:
-                self.verify_checksum(local_file)
-            except WrongChecksum as e:
-                raise WorkflowError(
-                    f"Local repository file {self.lfs_path!r} exists, but has different "
-                    f"content:\n"
-                    f"  Expected OID: {e.expected}\n"
-                    f"  Found OID:    {e.observed}"
-                ) from e
-            link_or_copy(local_file, local_path)
-            logger.info(f"Retrieved {filename} from local repo ({self.oid[:12]})")
+        pointer = await self.provider.get_pointer_metadata(self.ref, self.lfs_path)
+        if pointer is None:
+            raise WorkflowError(
+                f"File not found in repository: {self.lfs_path!r} at {self.ref!r}"
+            )
+
+        # Regular file (not LFS)
+        if pointer.oid is None:
+            assert pointer.tmp_path is not None
+            link_or_copy(pointer.tmp_path, local_path, may_symlink=False)
+            if self.provider.cache:
+                self.provider.cache.put(query, local_path)
+            logger.info(f"Retrieved {filename} (regular git file)")
             return
+
+        oid = pointer.oid
+
+        # 1. Try local LFS object store
+        if self.provider.local_git:
+            local_lfs = self.provider.local_git.find_lfs_object(oid)
+            if local_lfs is not None:
+                try:
+                    self.verify_checksum(local_lfs, oid)
+                except WrongChecksum as e:
+                    raise WorkflowError(
+                        f"Local LFS object for {self.lfs_path!r} has unexpected content:\n"
+                        f"  Expected OID: {e.expected}\n"
+                        f"  Found OID:    {e.observed}"
+                    ) from e
+                link_or_copy(local_lfs, local_path)
+                logger.info(f"Retrieved {filename} from local repo ({oid[:12]})")
+                return
 
         # 2. Try cache
         if self.provider.cache:
             cached = self.provider.cache.get(query)
             if cached is not None:
                 try:
-                    self.verify_checksum(cached)
+                    self.verify_checksum(cached, oid)
                     link_or_copy(cached, local_path)
-                    logger.info(f"Retrieved {filename} from cache ({self.oid[:12]})")
+                    logger.info(f"Retrieved {filename} from cache ({oid[:12]})")
                     return
                 except WrongChecksum as e:
                     logger.warning(
                         f"Cached file has unexpected checksum: expected {e.expected}, "
-                        f"got {e.observed}. Discarding cache entry and downloading from remote."
+                        f"got {e.observed}. Discarding cache entry and downloading."
                     )
-                    # Cache entry was corrupt – remove it
                     cached.unlink(missing_ok=True)
 
         # 3. Fetch download URL from LFS batch API
-        metadata = await self.provider.get_metadata(self.oid)
-        if metadata is None:
-            raise WorkflowError(f"LFS object not found: {self.oid}")
-
-        download_url = metadata.download_url
-        if not download_url:
-            raise WorkflowError(
-                f"No download URL returned by LFS batch API for OID {self.oid}"
-            )
+        download = await self.provider.get_download_metadata(oid)
+        if download is None:
+            raise WorkflowError(f"LFS object not found: {oid}")
 
         # Check for existing partial file to resume
         offset = local_path.stat().st_size if local_path.exists() else 0
-        headers = dict(metadata.download_headers)
+        headers = dict(download.headers)
         if offset > 0:
             headers["Range"] = f"bytes={offset}-"
 
         try:
             async with (
                 self.provider.client() as client,
-                client.stream("get", download_url, headers=headers) as response,
+                client.stream("get", download.url, headers=headers) as response,
             ):
                 if response.status_code == 206:
-                    # Server supports resume — append to existing partial file
                     mode = "ab"
                     logger.info(f"Resuming {filename} from byte {offset}")
                 elif response.status_code == 200:
-                    # Server does not support Range — discard partial and restart
                     mode = "wb"
                     offset = 0
                 elif response.status_code >= 500:
                     raise httpx.HTTPStatusError(
-                        f"Failed to download LFS object: HTTP {response.status_code} ({download_url})",
+                        f"Failed to download LFS object: HTTP {response.status_code} ({download.url})",
                         request=response.request,
                         response=response,
                     )
                 else:
                     raise WorkflowError(
-                        f"Failed to download LFS object: HTTP {response.status_code} ({download_url})"
+                        f"Failed to download LFS object: HTTP {response.status_code} ({download.url})"
                     )
 
                 total_size = int(response.headers.get("content-length", 0)) + offset
@@ -628,8 +578,8 @@ class StorageObject(StorageObjectRead):
                             f.write(chunk)
                             pbar.update(len(chunk))
 
-            self.verify_checksum(local_path)
-            logger.info(f"Retrieved {filename} from remote ({self.oid[:12]})")
+            self.verify_checksum(local_path, oid)
+            logger.info(f"Retrieved {filename} from remote ({oid[:12]})")
 
             if self.provider.cache:
                 self.provider.cache.put(query, local_path)

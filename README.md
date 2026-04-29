@@ -9,11 +9,13 @@ A Snakemake storage plugin for downloading files from Git LFS (Large File Storag
 
 ## Features
 
-- **Git LFS protocol**: Fetches objects via the [Git LFS Batch API](https://github.com/git-lfs/git-lfs/blob/main/docs/api/batch.md)
+- **Git ref-based URLs**: Reference files by tag or commit
+- **Regular file support**: Works for both LFS-tracked and regular git files at the given ref
+- **Git API integration**: Resolves file pointers via the GitHub or GitLab API, or a local repository
 - **Local repo lookup**: Checks a local git repository's LFS store before downloading remotely
 - **Local caching**: Downloaded objects can be cached to avoid redundant transfers
 - **Checksum verification**: Verifies SHA-256 integrity (the LFS OID *is* the SHA-256 digest)
-- **Authentication**: Supports token-based Basic Auth via environment variable
+- **Authentication**: Supports token-based auth via environment variable (Bearer for GitHub/GitLab API, Basic for LFS)
 - **Concurrent download control**: Limits simultaneous downloads
 - **Progress bars**: Shows download progress with tqdm
 - **Immutable objects**: Returns mtime=0 (LFS objects are content-addressed and never change)
@@ -27,20 +29,27 @@ pip install snakemake-storage-plugin-lfs
 
 ## URL Format
 
-LFS objects are referenced using the `lfs://` scheme:
+Files are referenced using the `lfs://` scheme with a git ref:
 
 ```
-lfs://{oid}/{path}
+lfs://{ref}/{path}
 ```
 
-- `{oid}` — SHA-256 hex digest of the object (64 hex characters)
-- `{path}` — logical file path used as the local filename
+- `{ref}` — a fixed git ref: a tag (`v1.2.3`) or a full/short commit hash (`abc1234`)
+- `{path}` — path to the file within the repository
 
-**Example:**
+Use only tags or commit hashes — **not branch names**. Branch names are mutable and would break Snakemake's assumption that a given input URL always refers to the same content.
+
+**Examples:**
 
 ```
-lfs://3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b4/data/natura.tiff
+lfs://v1.2.3/data/natura.tiff
+lfs://abc1234def/costs/v0.10.1/costs_2030.csv
 ```
+
+The plugin resolves the file at the given ref using the GitHub or GitLab API (or a local repository), reads the LFS pointer to obtain the OID, and then downloads the object from the LFS server. Regular (non-LFS) files at the same ref are also supported and retrieved directly.
+
+> **Breaking change from before v0.3:** The previous URL format `lfs://{oid}/{path}` (where `{oid}` was the 64-character SHA-256 LFS object ID) is no longer supported. Migrate by replacing the OID with the git ref (tag or commit) at which you want to pin the file.
 
 ## Configuration
 
@@ -56,11 +65,11 @@ storage lfs:
 
 | Setting | Default | Env var | Description |
 |---------|---------|---------|-------------|
-| `repo_url` | `""` | `SNAKEMAKE_STORAGE_LFS_REPO_URL` | Git repository URL used to construct the LFS Batch API endpoint (e.g. `https://github.com/org/repo`). **Required.** |
-| `token_envvar` | `""` | — | Name of the environment variable containing the authentication token (used as Basic Auth password with username `git`). |
-| `local_repo` | `""` | `SNAKEMAKE_STORAGE_LFS_LOCAL_REPO` | Path to a local git repository. Files are looked up by path in the working tree before downloading remotely. If the file exists but its SHA-256 hash does not match the OID, a `WorkflowError` is raised (the local repo contains a different version). LFS pointer stubs (not-yet-pulled files) are detected and skipped. |
+| `repo_url` | `""` | `SNAKEMAKE_STORAGE_LFS_REPO_URL` | Git repository URL, used to query the API and construct the LFS Batch API endpoint (e.g. `https://github.com/org/repo`). **Required.** |
+| `token_envvar` | `""` | — | Name of the environment variable containing the authentication token. Used as Bearer auth for the GitHub/GitLab API and as Basic auth for the LFS server. |
+| `local_repo` | `""` | `SNAKEMAKE_STORAGE_LFS_LOCAL_REPO` | Path to a local git repository. Pointer resolution and LFS object lookup are attempted locally before falling back to the remote API. |
 | `cache` | `""` | `SNAKEMAKE_STORAGE_LFS_CACHE` | Path to a cache directory for downloaded objects. Set to a path to enable caching; leave empty to disable. |
-| `skip_remote_checks` | `False` | `SNAKEMAKE_STORAGE_LFS_SKIP_REMOTE_CHECKS` | Skip existence/size checks against the remote LFS server. Useful in CI/CD when inputs are known to exist. |
+| `skip_remote_checks` | `False` | `SNAKEMAKE_STORAGE_LFS_SKIP_REMOTE_CHECKS` | Skip existence/size checks against the remote. Useful in CI/CD when inputs are known to exist. |
 | `max_concurrent_downloads` | `3` | — | Maximum number of simultaneous downloads. |
 
 ## Usage
@@ -68,24 +77,30 @@ storage lfs:
 Use `lfs://` URLs directly in your rules:
 
 ```python
+storage lfs:
+    provider="lfs",
+    repo_url="https://github.com/org/repo",
+    token_envvar="GITHUB_TOKEN",
+
 rule use_lfs_file:
     input:
-        storage.lfs(
-            "lfs://3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b4/data/natura.tiff"
-        ),
+        storage.lfs("lfs://v1.2.3/data/natura.tiff"),
     output:
-        "resources/natura.tiff"
+        "resources/natura.tiff",
     shell:
         "cp {input} {output}"
 ```
 
 The plugin will:
-1. Check the local git repository's LFS store (if `local_repo` is set)
-2. Check the local cache (if `cache` is set)
-3. If not found locally, query the LFS Batch API for a download URL
-4. Download the object with a progress bar
-5. Verify the SHA-256 checksum against the OID
-6. Store in the cache (if `cache` is set)
+1. Resolve the file pointer at the given ref via the local repo or remote API
+2. For regular files: retrieve content directly from git
+3. For LFS files:
+   - Check the local git repository's LFS store (if `local_repo` is set)
+   - Check the local cache (if `cache` is set)
+   - Query the LFS Batch API for a download URL
+   - Download the object with a progress bar
+   - Verify the SHA-256 checksum against the OID
+   - Store in the cache (if `cache` is set)
 
 ### Authentication
 
@@ -103,6 +118,8 @@ export GITHUB_TOKEN="ghp_..."
 snakemake --cores all
 ```
 
+The same token is used for both the GitHub/GitLab API (Bearer auth) and the LFS server (Basic auth with username `git`).
+
 ### CI/CD Configuration
 
 ```yaml
@@ -116,13 +133,27 @@ snakemake --cores all
     snakemake --cores all
 ```
 
-## How LFS Objects Are Located
+### Using a Local Repository
+
+If you have a local clone of the repository, the plugin will resolve file pointers and look up LFS objects locally first, avoiding API calls:
+
+```python
+storage lfs:
+    provider="lfs",
+    repo_url="https://github.com/org/repo",
+    local_repo="/path/to/local/clone",
+```
+
+Both bare repositories and working-tree clones are supported. For bare repos the LFS object store is checked at `{local_repo}/lfs/objects/`; for working-tree repos at `{local_repo}/.git/lfs/objects/`.
+
+## How Files Are Located
 
 Priority order in `managed_retrieve()`:
 
-1. **Local repo** (`local_repo` setting): Looks up the file by its path in the working tree (`{local_repo}/{lfs_path}`). LFS pointer stubs are skipped (with a warning). If the file is present but its SHA-256 does not match the OID, a `WorkflowError` is raised — the local repo contains a different version of the file.
-2. **Cache** (`cache` setting): Checks the configured cache directory.
-3. **Remote**: Queries the LFS Batch API (`{repo_url}.git/info/lfs/objects/batch`) and downloads from the returned URL.
+1. **Pointer resolution** (always): The file pointer at `{ref}:{path}` is resolved via the local repo (`git cat-file blob`) or the GitHub/GitLab API. For regular files the content is returned directly. For LFS files the OID is extracted from the pointer.
+2. **Local LFS store** (`local_repo` setting): Looks up the LFS object by OID in the local repo's LFS object store. If found but the SHA-256 does not match the OID, a `WorkflowError` is raised.
+3. **Cache** (`cache` setting): Checks the configured cache directory.
+4. **Remote LFS**: Queries the LFS Batch API (`{repo_url}.git/info/lfs/objects/batch`) and downloads from the returned URL.
 
 ## License
 
